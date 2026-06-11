@@ -21,14 +21,11 @@ def _database_conninfo() -> str:
         return database_url
 
     database = os.environ.get("POSTGRES_DB", "coverage_dashboard").strip()
-    user = os.environ.get("POSTGRES_USER", "coverage").strip()
-    password = os.environ.get("POSTGRES_PASSWORD", "").strip()
+    user = os.environ.get("POSTGRES_USER", "postgres").strip()
     host = os.environ.get("POSTGRES_HOST", "localhost").strip()
     port = os.environ.get("POSTGRES_PORT", "5432").strip()
 
     kwargs = {"dbname": database, "user": user, "host": host, "port": port}
-    if password:
-        kwargs["password"] = password
     return make_conninfo("", **kwargs)
 
 

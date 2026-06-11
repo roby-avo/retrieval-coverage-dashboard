@@ -34,7 +34,8 @@ import {
   LiveAttempt,
   MentionDetail,
   MentionRow,
-  Run
+  Run,
+  SourceDataset
 } from "./api";
 
 const PAGE_SIZE = 100;
@@ -116,7 +117,18 @@ function jobProgress(job: ExperimentJob): number {
 
 function estimateMentions(config: ExperimentConfig | null): number | null {
   if (!config) return null;
-  return config.dataset_sample_size * config.tables_per_dataset * config.records_per_table;
+  const targetedDatasets = config.dataset_allowlist?.length ?? 0;
+  const requestedDatasets = config.requested_datasets?.length ?? 0;
+  const availableDatasets = targetedDatasets || requestedDatasets || config.dataset_sample_size;
+  const datasetCount = config.dataset_sample_size > 0 ? Math.min(config.dataset_sample_size, availableDatasets) : availableDatasets;
+  return datasetCount * config.tables_per_dataset * config.records_per_table;
+}
+
+function experimentDatasetLabel(config: ExperimentConfig): string {
+  const targets = config.dataset_allowlist ?? [];
+  if (targets.length === 1) return targets[0];
+  if (targets.length > 1) return `${targets.length} targeted datasets`;
+  return `${config.dataset_sample_size || "all"} random datasets`;
 }
 
 function formatDuration(seconds: number | null | undefined): string {
@@ -140,6 +152,7 @@ export default function App() {
   const [selectedRun, setSelectedRun] = useState<Run | null>(null);
   const [experimentConfig, setExperimentConfig] = useState<ExperimentConfig | null>(null);
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
+  const [sourceDatasets, setSourceDatasets] = useState<SourceDataset[]>([]);
   const [databaseSize, setDatabaseSize] = useState<DatabaseSize | null>(null);
   const [jobs, setJobs] = useState<ExperimentJob[]>([]);
   const [activeJobId, setActiveJobId] = useState<number | null>(null);
@@ -201,6 +214,7 @@ export default function App() {
       refreshRuns(),
       api.experimentDefaults().then(setExperimentConfig),
       api.configStatus().then(setConfigStatus),
+      api.sourceDatasets().then(setSourceDatasets),
       api.databaseSize().then(setDatabaseSize)
     ]).catch((exc) =>
       setError(String(exc.message ?? exc))
@@ -247,6 +261,16 @@ export default function App() {
 
   function updateExperimentConfig<K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) {
     setExperimentConfig((current) => (current ? { ...current, [key]: value } : current));
+  }
+
+  function updateTargetDataset(datasetId: string) {
+    setExperimentConfig((current) => {
+      if (!current) return current;
+      if (!datasetId) {
+        return { ...current, dataset_allowlist: [] };
+      }
+      return { ...current, dataset_allowlist: [datasetId], dataset_sample_size: 1 };
+    });
   }
 
   async function startExperiment() {
@@ -313,7 +337,7 @@ export default function App() {
           {experimentConfig && (
             <>
               <div className="run-summary">
-                <span>Notebook workflow</span>
+                <span>{experimentDatasetLabel(experimentConfig)}</span>
                 <strong>
                   {compactNumber(estimatedMentions)} mentions x {compactNumber(experimentConfig.max_candidates)} retrieval window
                 </strong>
@@ -333,6 +357,17 @@ export default function App() {
                   placeholder="webapp_random_sampler"
                   onChange={(event) => updateExperimentConfig("name", event.target.value)}
                 />
+              </label>
+              <label>
+                Dataset target
+                <select value={experimentConfig.dataset_allowlist?.[0] ?? ""} onChange={(event) => updateTargetDataset(event.target.value)}>
+                  <option value="">Random seeded datasets</option>
+                  {sourceDatasets.map((dataset) => (
+                    <option key={dataset.dataset_id} value={dataset.dataset_id}>
+                      {dataset.dataset_id} ({compactNumber(dataset.mention_count)} mentions)
+                    </option>
+                  ))}
+                </select>
               </label>
               <div className="config-grid">
                 <label>
@@ -362,7 +397,7 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
-                    max={9}
+                    max={Math.max(sourceDatasets.length, experimentConfig.requested_datasets.length, 1)}
                     value={experimentConfig.dataset_sample_size}
                     onChange={(event) => updateExperimentConfig("dataset_sample_size", Number(event.target.value))}
                   />
@@ -738,7 +773,8 @@ function JobList({
             </div>
             <div className="job-message">{job.message || stageLabel(job.stage)}</div>
             <div className="job-config-line">
-              {stageLabel(job.stage)} · seed {job.config.random_seed} · {compactNumber(sampleCount)} mentions · top {compactNumber(job.config.max_candidates)}
+              {stageLabel(job.stage)} · {experimentDatasetLabel(job.config)} · seed {job.config.random_seed} · {compactNumber(sampleCount)} mentions · top{" "}
+              {compactNumber(job.config.max_candidates)}
             </div>
             <div className="progress-track">
               <div className="progress-fill" style={{ width: `${progress}%` }} />

@@ -106,7 +106,7 @@ def normalize_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
             value = int(defaults[key])
         return max(minimum, min(maximum, value))
 
-    merged["dataset_sample_size"] = bounded_int("dataset_sample_size", 0, len(DEFAULT_DATASETS))
+    merged["dataset_sample_size"] = bounded_int("dataset_sample_size", 0, 1000)
     merged["tables_per_dataset"] = bounded_int("tables_per_dataset", 0, 1000)
     merged["records_per_table"] = bounded_int("records_per_table", 0, 1000)
     merged["random_seed"] = bounded_int("random_seed", 0, 2_147_483_647)

@@ -241,10 +241,10 @@ def build_random_sample_bundle_from_db(config: dict[str, Any]) -> dict[str, Any]
 
     with connect() as conn:
         inventory = source_dataset_inventory(conn)
-        if requested:
-            inventory = [item for item in inventory if item["dataset_id"] in set(requested)]
         if dataset_allowlist:
             inventory = [item for item in inventory if item["dataset_id"] in dataset_allowlist]
+        elif requested:
+            inventory = [item for item in inventory if item["dataset_id"] in set(requested)]
         inventory.sort(key=lambda item: item["dataset_id"])
 
         rng = random.Random(int(config.get("random_seed") or 0))

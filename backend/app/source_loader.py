@@ -85,6 +85,21 @@ def _resolve_dataset(root: Path, requested_name: str) -> dict[str, Any] | None:
     return None
 
 
+def _discover_dataset_names(root: Path) -> list[str]:
+    if not root.is_dir():
+        return []
+    names: list[str] = []
+    for dataset_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        if not (dataset_dir / "tables").is_dir():
+            continue
+        try:
+            _discover_gt_path(dataset_dir)
+        except FileNotFoundError:
+            continue
+        names.append(dataset_dir.name)
+    return names
+
+
 @lru_cache(maxsize=16)
 def _load_filename_map(path_text: str) -> dict[str, str]:
     path = Path(path_text)
@@ -163,11 +178,14 @@ def _table_metadata(
     }
 
 
-def _requested_datasets() -> list[str]:
+def _requested_datasets(source_root: Path) -> list[str]:
     raw = os.environ.get("SOURCE_DATASETS")
     if not raw:
-        return DEFAULT_DATASETS
-    return [item.strip() for item in raw.split(",") if item.strip()]
+        return _dedupe([*DEFAULT_DATASETS, *_discover_dataset_names(source_root)])
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    if len(requested) == 1 and requested[0].casefold() == "all":
+        return _discover_dataset_names(source_root)
+    return requested
 
 
 def _source_path(source_root: Path, path: Path) -> tuple[str, str]:
@@ -212,6 +230,8 @@ def seed_source_data(*, source_root: Path, requested_datasets: Sequence[str], fo
             return {"seeded": False, "reason": "source metadata already populated", "imported": [], "warnings": []}
 
         for dataset_id in requested_datasets:
+            if not force and metadata_complete and dataset_id in existing_dataset_ids:
+                continue
             try:
                 dataset_spec = _resolve_dataset(source_root, dataset_id)
                 if dataset_spec is None:
@@ -312,13 +332,15 @@ def seed_source_data(*, source_root: Path, requested_datasets: Sequence[str], fo
                     }
                 )
 
+    if not imported:
+        return {"seeded": False, "reason": "no new source metadata imported", "imported": imported, "warnings": warnings}
     return {"seeded": True, "imported": imported, "warnings": warnings}
 
 
 def main() -> None:
     source_root = Path(os.environ.get("SOURCE_DATA_ROOT", "/source-data"))
     force = os.environ.get("SOURCE_DATA_FORCE", "0").strip().lower() in {"1", "true", "yes"}
-    result = seed_source_data(source_root=source_root, requested_datasets=_requested_datasets(), force=force)
+    result = seed_source_data(source_root=source_root, requested_datasets=_requested_datasets(source_root), force=force)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

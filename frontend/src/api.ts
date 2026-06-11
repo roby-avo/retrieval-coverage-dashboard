@@ -31,6 +31,8 @@ export type ExperimentConfig = {
   enable_llm_url_hints: boolean;
   url_hint_boost: number;
   url_hint_confidence_threshold: number;
+  dataset_allowlist: string[];
+  table_allowlist_by_dataset: Record<string, string[]>;
   max_tasks_per_llm_request: number;
   openrouter_parallel_requests: number;
   max_workers: number;
@@ -74,6 +76,15 @@ export type ConfigStatus = {
   alpaca_configured: boolean;
   openrouter_configured: boolean;
   alpaca_token_aliases: string[];
+};
+
+export type SourceDataset = {
+  dataset_id: string;
+  directory_name?: string;
+  table_count: number;
+  mention_count: number;
+  imported_at?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export type DatabaseSize = {
@@ -261,6 +272,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
   experimentDefaults: () => request<ExperimentConfig>("/api/experiment-defaults"),
   configStatus: () => request<ConfigStatus>("/api/config-status"),
+  sourceDatasets: () => request<SourceDataset[]>("/api/source-datasets"),
   databaseSize: () => request<DatabaseSize>("/api/database-size"),
   experimentJobs: () => request<ExperimentJob[]>("/api/experiment-jobs"),
   experimentJob: (id: number) => request<ExperimentJob>(`/api/experiment-jobs/${id}`),
