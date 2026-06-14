@@ -41,6 +41,7 @@ DEFAULT_DATASETS = [
 ]
 OPENROUTER_REQUIRED_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_REQUIRED_PROVIDER = "Cerebras"
+DEFAULT_LLM_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 TYPO_CORRECTION_CONFIDENCE_THRESHOLD = 0.85
 STOPWORDS = {"a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "is", "of", "on", "or", "the", "to", "with"}
 
@@ -57,6 +58,11 @@ def _job_name(job_id: int, config: dict[str, Any]) -> str:
 
 
 def default_experiment_config() -> dict[str, Any]:
+    llm_provider = os.environ.get("LLM_PROVIDER", "openrouter").strip() or "openrouter"
+    llm_provider_name = os.environ.get("LLM_PROVIDER_NAME", os.environ.get("OPENROUTER_PROVIDER", OPENROUTER_REQUIRED_PROVIDER)).strip()
+    llm_model = os.environ.get("LLM_MODEL", os.environ.get("OPENROUTER_MODEL", OPENROUTER_REQUIRED_MODEL)).strip()
+    llm_api_url = os.environ.get("LLM_API_URL", os.environ.get("OPENROUTER_CHAT_URL", DEFAULT_LLM_CHAT_URL)).strip()
+    llm_parallel_requests = int(os.environ.get("LLM_PARALLEL_REQUESTS", os.environ.get("OPENROUTER_PARALLEL_REQUESTS", "2")))
     return {
         "name": "",
         "requested_datasets": DEFAULT_DATASETS,
@@ -79,12 +85,26 @@ def default_experiment_config() -> dict[str, Any]:
         "dataset_allowlist": [],
         "table_allowlist_by_dataset": {},
         "max_tasks_per_llm_request": 8,
-        "openrouter_parallel_requests": 2,
+        "llm_parallel_requests": llm_parallel_requests,
         "max_workers": 8,
+        "llm_enabled": True,
+        "llm_provider": llm_provider,
+        "llm_provider_name": llm_provider_name,
+        "llm_api_url": llm_api_url,
+        "llm_api_key": "",
+        "llm_model": llm_model,
+        "llm_reasoning_effort": "high",
+        "llm_temperature": float(os.environ.get("LLM_TEMPERATURE", os.environ.get("OPENROUTER_TEMPERATURE", "0.1"))),
+        "llm_timeout_seconds": int(os.environ.get("LLM_TIMEOUT_SECONDS", os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "180"))),
+        "llm_max_retries": int(os.environ.get("LLM_MAX_RETRIES", os.environ.get("OPENROUTER_MAX_RETRIES", "5"))),
+        "llm_site_url": os.environ.get("LLM_SITE_URL", os.environ.get("OPENROUTER_SITE_URL", "http://localhost")),
+        "llm_app_name": os.environ.get("LLM_APP_NAME", os.environ.get("OPENROUTER_APP_NAME", "alpaca-random-coverage-sampler")),
+        "llm_max_tokens": int(os.environ["LLM_MAX_TOKENS"]) if os.environ.get("LLM_MAX_TOKENS") else int(os.environ["OPENROUTER_MAX_TOKENS"]) if os.environ.get("OPENROUTER_MAX_TOKENS") else None,
         "use_openrouter": True,
         "use_heuristic_fallback_on_llm_failure": True,
-        "openrouter_model": OPENROUTER_REQUIRED_MODEL,
-        "openrouter_provider": OPENROUTER_REQUIRED_PROVIDER,
+        "openrouter_parallel_requests": llm_parallel_requests,
+        "openrouter_model": llm_model,
+        "openrouter_provider": llm_provider_name,
         "openrouter_reasoning_effort": "high",
         "openrouter_temperature": float(os.environ.get("OPENROUTER_TEMPERATURE", "0.1")),
         "openrouter_timeout_seconds": int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "180")),
@@ -115,7 +135,10 @@ def normalize_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
     merged["max_candidates"] = bounded_int("max_candidates", 1, MAX_RETRIEVAL_CANDIDATES)
     merged["dashboard_candidate_limit"] = bounded_int("dashboard_candidate_limit", 1, MAX_RETURNED_CANDIDATES)
     merged["max_tasks_per_llm_request"] = bounded_int("max_tasks_per_llm_request", 1, 100)
-    merged["openrouter_parallel_requests"] = bounded_int("openrouter_parallel_requests", 1, 16)
+    if "llm_parallel_requests" not in merged and "openrouter_parallel_requests" in merged:
+        merged["llm_parallel_requests"] = merged["openrouter_parallel_requests"]
+    merged["llm_parallel_requests"] = bounded_int("llm_parallel_requests", 1, 16)
+    merged["openrouter_parallel_requests"] = merged["llm_parallel_requests"]
     merged["max_workers"] = bounded_int("max_workers", 1, 32)
     merged["recall_query_variant_limit"] = bounded_int("recall_query_variant_limit", 1, 100)
     merged["recall_context_term_limit"] = bounded_int("recall_context_term_limit", 1, 200)
@@ -129,18 +152,60 @@ def normalize_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(merged.get("table_allowlist_by_dataset"), dict):
         merged["table_allowlist_by_dataset"] = {}
 
-    merged["openrouter_model"] = OPENROUTER_REQUIRED_MODEL
-    merged["openrouter_provider"] = OPENROUTER_REQUIRED_PROVIDER
-    merged["openrouter_reasoning_effort"] = "high"
+    provider = str(merged.get("llm_provider") or ("openrouter" if merged.get("use_openrouter", True) else "none")).strip().lower()
+    if provider in {"off", "disabled", "false"}:
+        provider = "none"
+    merged["llm_provider"] = provider
+    merged["llm_enabled"] = bool(merged.get("llm_enabled", merged.get("use_openrouter", True))) and provider != "none"
+    merged["use_openrouter"] = merged["llm_enabled"]
+    merged["llm_provider_name"] = str(merged.get("llm_provider_name") or merged.get("openrouter_provider") or "").strip()
+    merged["llm_api_url"] = str(merged.get("llm_api_url") or os.environ.get("LLM_API_URL") or os.environ.get("OPENROUTER_CHAT_URL") or DEFAULT_LLM_CHAT_URL).strip()
+    merged["llm_api_key"] = str(merged.get("llm_api_key") or "").strip()
+    merged["llm_model"] = str(merged.get("llm_model") or merged.get("openrouter_model") or OPENROUTER_REQUIRED_MODEL).strip()
+    merged["llm_reasoning_effort"] = str(merged.get("llm_reasoning_effort") or merged.get("openrouter_reasoning_effort") or "high").strip()
+    merged["openrouter_model"] = merged["llm_model"]
+    merged["openrouter_provider"] = merged["llm_provider_name"] or OPENROUTER_REQUIRED_PROVIDER
+    merged["openrouter_reasoning_effort"] = merged["llm_reasoning_effort"]
+    for next_key, legacy_key in (
+        ("llm_temperature", "openrouter_temperature"),
+        ("llm_timeout_seconds", "openrouter_timeout_seconds"),
+        ("llm_max_tokens", "openrouter_max_tokens"),
+    ):
+        if next_key not in merged and legacy_key in merged:
+            merged[next_key] = merged[legacy_key]
+    for next_key, legacy_key in (
+        ("llm_site_url", "openrouter_site_url"),
+        ("llm_app_name", "openrouter_app_name"),
+    ):
+        merged[next_key] = str(merged.get(next_key) or merged.get(legacy_key) or defaults[next_key])
     try:
-        merged["openrouter_max_retries"] = max(5, int(merged.get("openrouter_max_retries") or 5))
+        merged["llm_temperature"] = float(merged.get("llm_temperature", 0.1))
     except (TypeError, ValueError):
-        merged["openrouter_max_retries"] = 5
+        merged["llm_temperature"] = float(defaults["llm_temperature"])
+    try:
+        merged["llm_timeout_seconds"] = max(1, int(merged.get("llm_timeout_seconds") or defaults["llm_timeout_seconds"]))
+    except (TypeError, ValueError):
+        merged["llm_timeout_seconds"] = defaults["llm_timeout_seconds"]
+    try:
+        merged["llm_max_retries"] = max(1, int(merged.get("llm_max_retries") or merged.get("openrouter_max_retries") or 5))
+    except (TypeError, ValueError):
+        merged["llm_max_retries"] = 5
+    try:
+        merged["llm_max_tokens"] = int(merged["llm_max_tokens"]) if merged.get("llm_max_tokens") is not None and merged.get("llm_max_tokens") != "" else None
+    except (TypeError, ValueError):
+        merged["llm_max_tokens"] = None
+    merged["openrouter_temperature"] = merged["llm_temperature"]
+    merged["openrouter_timeout_seconds"] = merged["llm_timeout_seconds"]
+    merged["openrouter_max_retries"] = merged["llm_max_retries"]
+    merged["openrouter_site_url"] = merged["llm_site_url"]
+    merged["openrouter_app_name"] = merged["llm_app_name"]
+    merged["openrouter_max_tokens"] = merged["llm_max_tokens"]
 
     for key in (
         "save_full_debug_output",
         "enable_recall_query_expansion",
         "enable_llm_url_hints",
+        "llm_enabled",
         "use_openrouter",
         "use_heuristic_fallback_on_llm_failure",
     ):
@@ -181,6 +246,36 @@ def update_job(job_id: int, **fields: Any) -> None:
         conn.commit()
 
 
+def _llm_api_key(config: dict[str, Any]) -> str:
+    return str(
+        config.get("llm_api_key")
+        or os.environ.get("LLM_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+        or ""
+    ).strip()
+
+
+def _llm_endpoint(config: dict[str, Any]) -> str:
+    raw = str(config.get("llm_api_url") or os.environ.get("LLM_API_URL") or os.environ.get("OPENROUTER_CHAT_URL") or DEFAULT_LLM_CHAT_URL).strip()
+    if not raw:
+        return DEFAULT_LLM_CHAT_URL
+    trimmed = raw.rstrip("/")
+    if trimmed.endswith("/chat/completions"):
+        return raw
+    if trimmed.endswith("/v1"):
+        return f"{trimmed}/chat/completions"
+    if "://" in trimmed and "/" not in trimmed.split("://", 1)[1]:
+        return f"{trimmed}/v1/chat/completions"
+    return raw
+
+
+def _llm_label(config: dict[str, Any]) -> str:
+    if not config.get("llm_enabled", config.get("use_openrouter")):
+        return "Heuristic"
+    provider = str(config.get("llm_provider_name") or config.get("llm_provider") or "LLM").strip()
+    return provider if provider.casefold() != "openai_compatible" else "OpenAI-compatible"
+
+
 def _sampling_config(config: dict[str, Any], run_started_at: datetime) -> dict[str, Any]:
     return {
         "dataset_sample_size": config["dataset_sample_size"],
@@ -192,6 +287,11 @@ def _sampling_config(config: dict[str, Any], run_started_at: datetime) -> dict[s
         "max_candidates": config["max_candidates"],
         "context_rows": config["context_rows"],
         "table_context_preview_rows": config["table_context_preview_rows"],
+        "llm_provider": config["llm_provider"],
+        "llm_provider_name": config["llm_provider_name"],
+        "llm_api_url": _llm_endpoint(config),
+        "llm_model": config["llm_model"],
+        "llm_parallel_requests": config["llm_parallel_requests"],
         "openrouter_model": config["openrouter_model"],
         "openrouter_provider": config["openrouter_provider"],
         "openrouter_parallel_requests": config["openrouter_parallel_requests"],
@@ -405,7 +505,7 @@ def _normalize_plan(raw_plan: dict[str, Any], sample: dict[str, Any]) -> dict[st
     }
 
 
-def _openrouter_batch_body(samples: Sequence[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+def _llm_batch_body(samples: Sequence[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
     tasks = [
         {
             "id": sample["sample_id"],
@@ -423,12 +523,9 @@ def _openrouter_batch_body(samples: Sequence[dict[str, Any]], config: dict[str, 
         }
         for sample in samples
     ]
-    return {
-        "model": config["openrouter_model"],
-        "temperature": float(config["openrouter_temperature"]),
-        "provider": {"order": [config["openrouter_provider"]], "allow_fallbacks": False},
-        "include_reasoning": False,
-        "reasoning": {"effort": config["openrouter_reasoning_effort"]},
+    body: dict[str, Any] = {
+        "model": config["llm_model"],
+        "temperature": float(config["llm_temperature"]),
         "response_format": {"type": "json_object"},
         "messages": [
             {
@@ -468,20 +565,26 @@ def _openrouter_batch_body(samples: Sequence[dict[str, Any]], config: dict[str, 
             },
         ],
     }
+    if config.get("llm_provider") == "openrouter":
+        body["include_reasoning"] = False
+        body["reasoning"] = {"effort": config["llm_reasoning_effort"]}
+        if config.get("llm_provider_name"):
+            body["provider"] = {"order": [config["llm_provider_name"]], "allow_fallbacks": False}
+    return body
 
 
-def _call_openrouter_batch(samples: Sequence[dict[str, Any]], config: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    token = os.environ.get("OPENROUTER_API_KEY", "").strip()
+def _call_llm_batch(samples: Sequence[dict[str, Any]], config: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    token = _llm_api_key(config)
     if not token:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-    endpoint = os.environ.get("OPENROUTER_CHAT_URL", "https://openrouter.ai/api/v1/chat/completions")
-    body = _openrouter_batch_body(samples, config)
-    if config.get("openrouter_max_tokens") is not None:
-        body["max_tokens"] = config["openrouter_max_tokens"]
+        raise RuntimeError("LLM API key is not configured")
+    endpoint = _llm_endpoint(config)
+    body = _llm_batch_body(samples, config)
+    if config.get("llm_max_tokens") is not None:
+        body["max_tokens"] = config["llm_max_tokens"]
 
-    timeout = int(config["openrouter_timeout_seconds"])
-    max_retries = max(1, int(config["openrouter_max_retries"]))
-    retry_base_seconds = max(0.5, float(os.environ.get("OPENROUTER_RETRY_BASE_SECONDS", "4")))
+    timeout = int(config["llm_timeout_seconds"])
+    max_retries = max(1, int(config["llm_max_retries"]))
+    retry_base_seconds = max(0.5, float(os.environ.get("LLM_RETRY_BASE_SECONDS", os.environ.get("OPENROUTER_RETRY_BASE_SECONDS", "4"))))
     payload: dict[str, Any] = {}
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -491,8 +594,8 @@ def _call_openrouter_batch(samples: Sequence[dict[str, Any]], config: dict[str, 
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": config["openrouter_site_url"],
-                "X-Title": config["openrouter_app_name"],
+                "HTTP-Referer": config["llm_site_url"],
+                "X-Title": config["llm_app_name"],
             },
             method="POST",
         )
@@ -502,19 +605,19 @@ def _call_openrouter_batch(samples: Sequence[dict[str, Any]], config: dict[str, 
             break
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            last_error = RuntimeError(f"OpenRouter HTTP {exc.code}: {detail[:500]}")
+            last_error = RuntimeError(f"{_llm_label(config)} HTTP {exc.code}: {detail[:500]}")
             if exc.code == 429 and attempt < max_retries:
                 time.sleep(min(90.0, retry_base_seconds * (2 ** (attempt - 1))))
                 continue
             raise last_error from exc
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last_error = RuntimeError(f"OpenRouter query planning failed: {exc}")
+            last_error = RuntimeError(f"{_llm_label(config)} query planning failed: {exc}")
             if attempt < max_retries:
                 time.sleep(min(30.0, retry_base_seconds * attempt))
                 continue
             raise last_error from exc
     else:
-        raise RuntimeError(f"OpenRouter query planning failed: {last_error}")
+        raise RuntimeError(f"{_llm_label(config)} query planning failed: {last_error}")
 
     content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
     parsed = _extract_json_object(str(content))
@@ -533,6 +636,8 @@ def _call_openrouter_batch(samples: Sequence[dict[str, Any]], config: dict[str, 
     log = {
         "error": None,
         "sample_count": len(samples),
+        "provider": config.get("llm_provider"),
+        "endpoint": endpoint,
         "request_body": body,
         "response_usage": payload.get("usage"),
         "response_model": payload.get("model"),
@@ -555,7 +660,7 @@ def _generate_query_plans(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     plans = {sample["sample_id"]: _heuristic_plan(sample) for sample in samples}
     logs: list[dict[str, Any]] = []
-    if not config["use_openrouter"]:
+    if not config["llm_enabled"]:
         if progress_callback:
             progress_callback(len(samples))
         return plans, logs
@@ -564,10 +669,11 @@ def _generate_query_plans(
         for sample in batch:
             plan = batch_plans.get(sample["sample_id"])
             if plan:
-                plan["query_plan_source"] = "openrouter"
+                plan["query_plan_source"] = str(config.get("llm_provider") or "llm")
                 plan["llm_inspection"] = {
                     "sent": True,
-                    "endpoint": os.environ.get("OPENROUTER_CHAT_URL", "https://openrouter.ai/api/v1/chat/completions"),
+                    "provider": log.get("provider"),
+                    "endpoint": log.get("endpoint"),
                     "batch_size": len(batch),
                     "task_ids": [item["sample_id"] for item in batch],
                     "request_body": log.get("request_body"),
@@ -583,12 +689,12 @@ def _generate_query_plans(
             plans[sample["sample_id"]]["query_plan_error"] = str(exc)
 
     batches = list(_batched(samples, config["max_tasks_per_llm_request"]))
-    parallel_requests = min(len(batches), max(1, int(config.get("openrouter_parallel_requests") or 1)))
+    parallel_requests = min(len(batches), max(1, int(config.get("llm_parallel_requests") or 1)))
     completed = 0
     if parallel_requests <= 1:
         for batch in batches:
             try:
-                batch_plans, log = _call_openrouter_batch(batch, config)
+                batch_plans, log = _call_llm_batch(batch, config)
                 apply_batch_plans(batch, batch_plans, log)
                 logs.append(log)
             except Exception as exc:
@@ -602,7 +708,7 @@ def _generate_query_plans(
         return plans, logs
 
     with ThreadPoolExecutor(max_workers=parallel_requests) as executor:
-        futures = {executor.submit(_call_openrouter_batch, batch, config): batch for batch in batches}
+        futures = {executor.submit(_call_llm_batch, batch, config): batch for batch in batches}
         for future in as_completed(futures):
             batch = futures[future]
             try:
@@ -895,7 +1001,7 @@ def run_experiment_job(job_id: int) -> None:
 
         set_stage_progress(
             "query_plans",
-            label="OpenRouter query plans" if config["use_openrouter"] else "Heuristic query plans",
+            label=f"{_llm_label(config)} query plans" if config["llm_enabled"] else "Heuristic query plans",
             current=0,
             total=len(samples),
             stage="query_plans",
@@ -910,7 +1016,7 @@ def run_experiment_job(job_id: int) -> None:
             query_plan_completed = completed
             set_stage_progress(
                 "query_plans",
-                label="OpenRouter query plans" if config["use_openrouter"] else "Heuristic query plans",
+                label=f"{_llm_label(config)} query plans" if config["llm_enabled"] else "Heuristic query plans",
                 current=completed,
                 total=len(samples),
                 stage="query_plans",
@@ -924,7 +1030,7 @@ def run_experiment_job(job_id: int) -> None:
         except Exception:
             set_stage_progress(
                 "query_plans",
-                label="OpenRouter query plans" if config["use_openrouter"] else "Heuristic query plans",
+                label=f"{_llm_label(config)} query plans" if config["llm_enabled"] else "Heuristic query plans",
                 current=query_plan_completed,
                 total=len(samples),
                 status="failed",
@@ -936,7 +1042,7 @@ def run_experiment_job(job_id: int) -> None:
             raise
         set_stage_progress(
             "query_plans",
-            label="OpenRouter query plans" if config["use_openrouter"] else "Heuristic query plans",
+            label=f"{_llm_label(config)} query plans" if config["llm_enabled"] else "Heuristic query plans",
             current=len(samples),
             total=len(samples),
             status="completed",

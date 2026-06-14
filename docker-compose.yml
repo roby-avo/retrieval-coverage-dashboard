@@ -32,6 +32,12 @@ services:
       ALPACA_TOKEN_AUTH: ${ALPACA_TOKEN_AUTH:-}
       ALPACA_METADATA_URL: ${ALPACA_METADATA_URL:-https://alpaca.zooverse.dev/debug/elasticsearch/alpaca-entities/_search}
       ALPACA_SEARCH_ENDPOINT: ${ALPACA_SEARCH_ENDPOINT:-https://alpaca.zooverse.dev/debug/elasticsearch/alpaca-entities/_search}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      LLM_PROVIDER_NAME: ${LLM_PROVIDER_NAME:-Cerebras}
+      LLM_API_URL: ${LLM_API_URL:-https://openrouter.ai/api/v1/chat/completions}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-openai/gpt-oss-120b}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-oss-120b}
       OPENROUTER_PROVIDER: ${OPENROUTER_PROVIDER:-Cerebras}

@@ -20,6 +20,7 @@ from psycopg.types.json import Jsonb
 from .datasets import source_dataset_inventory
 from .db import connect, init_database
 from .experiment_runner import create_experiment_job, default_experiment_config
+from .experiment_runner import normalize_experiment_config
 from .retrieval import (
     ALPACA_METADATA_URL,
     MAX_RETURNED_CANDIDATES,
@@ -58,10 +59,30 @@ class LiveAttemptRequest(BaseModel):
     candidate_count: int = Field(default=100, ge=1, le=MAX_RETRIEVAL_CANDIDATES)
     query_text: str | None = None
     human_guidance: str | None = Field(default=None, max_length=3000)
+    llm_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExperimentJobRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+SENSITIVE_CONFIG_KEYS = {"llm_api_key", "openrouter_api_key", "api_key"}
+
+
+def _redact_config(config: Any) -> Any:
+    if not isinstance(config, dict):
+        return config
+    redacted = dict(config)
+    for key in SENSITIVE_CONFIG_KEYS:
+        if redacted.get(key):
+            redacted[key] = "__configured__"
+    return redacted
+
+
+def _redact_job(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["config"] = _redact_config(item.get("config"))
+    return item
 
 
 def _row_or_404(row: dict[str, Any] | None, label: str = "Record") -> dict[str, Any]:
@@ -307,26 +328,55 @@ def normalize_query_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
 
 
-def _openrouter_json_request(messages: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
-    token = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not token:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-    endpoint = os.environ.get("OPENROUTER_CHAT_URL", "https://openrouter.ai/api/v1/chat/completions")
+def _llm_api_key(config: dict[str, Any]) -> str:
+    return str(config.get("llm_api_key") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or "").strip()
+
+
+def _llm_endpoint(config: dict[str, Any]) -> str:
+    raw = str(config.get("llm_api_url") or os.environ.get("LLM_API_URL") or os.environ.get("OPENROUTER_CHAT_URL") or "https://openrouter.ai/api/v1/chat/completions").strip()
+    trimmed = raw.rstrip("/")
+    if trimmed.endswith("/chat/completions"):
+        return raw
+    if trimmed.endswith("/v1"):
+        return f"{trimmed}/chat/completions"
+    if "://" in trimmed and "/" not in trimmed.split("://", 1)[1]:
+        return f"{trimmed}/v1/chat/completions"
+    return raw
+
+
+def _llm_label(config: dict[str, Any]) -> str:
+    provider = str(config.get("llm_provider_name") or config.get("llm_provider") or "LLM").strip()
+    return provider if provider.casefold() != "openai_compatible" else "OpenAI-compatible"
+
+
+def _llm_request_body(messages: list[dict[str, str]], config: dict[str, Any]) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "model": OPENROUTER_REQUIRED_MODEL,
-        "temperature": float(os.environ.get("OPENROUTER_TEMPERATURE", "0.1")),
+        "model": config["llm_model"],
+        "temperature": float(config["llm_temperature"]),
         "response_format": {"type": "json_object"},
-        "include_reasoning": False,
-        "reasoning": {"effort": "high"},
-        "provider": {"order": [OPENROUTER_REQUIRED_PROVIDER], "allow_fallbacks": False},
         "messages": messages,
     }
-    if os.environ.get("OPENROUTER_MAX_TOKENS"):
-        body["max_tokens"] = int(os.environ["OPENROUTER_MAX_TOKENS"])
+    if config.get("llm_provider") == "openrouter":
+        body["include_reasoning"] = False
+        body["reasoning"] = {"effort": config["llm_reasoning_effort"]}
+        if config.get("llm_provider_name"):
+            body["provider"] = {"order": [config["llm_provider_name"]], "allow_fallbacks": False}
+    if config.get("llm_max_tokens") is not None:
+        body["max_tokens"] = int(config["llm_max_tokens"])
+    return body
 
-    timeout = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "45"))
-    max_retries = max(1, int(os.environ.get("OPENROUTER_MAX_RETRIES", "5")))
-    retry_base_seconds = max(0.5, float(os.environ.get("OPENROUTER_RETRY_BASE_SECONDS", "4")))
+
+def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    config = normalize_experiment_config(llm_config or {})
+    token = _llm_api_key(config)
+    if not token:
+        raise RuntimeError("LLM API key is not configured")
+    endpoint = _llm_endpoint(config)
+    body = _llm_request_body(messages, config)
+
+    timeout = int(config["llm_timeout_seconds"])
+    max_retries = max(1, int(config["llm_max_retries"]))
+    retry_base_seconds = max(0.5, float(os.environ.get("LLM_RETRY_BASE_SECONDS", os.environ.get("OPENROUTER_RETRY_BASE_SECONDS", "4"))))
     last_error: Exception | None = None
     payload: dict[str, Any] = {}
     for attempt in range(1, max_retries + 1):
@@ -336,8 +386,8 @@ def _openrouter_json_request(messages: list[dict[str, str]]) -> tuple[dict[str, 
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "http://localhost"),
-                "X-Title": os.environ.get("OPENROUTER_APP_NAME", "coverage-dashboard"),
+                "HTTP-Referer": config["llm_site_url"],
+                "X-Title": config["llm_app_name"],
             },
             method="POST",
         )
@@ -347,30 +397,31 @@ def _openrouter_json_request(messages: list[dict[str, str]]) -> tuple[dict[str, 
             break
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            last_error = RuntimeError(f"OpenRouter HTTP {exc.code}: {detail[:500]}")
+            last_error = RuntimeError(f"{_llm_label(config)} HTTP {exc.code}: {detail[:500]}")
             if exc.code == 429 and attempt < max_retries:
                 time.sleep(min(90.0, retry_base_seconds * (2 ** (attempt - 1))))
                 continue
             raise last_error from exc
         except (URLError, TimeoutError, JSONDecodeError) as exc:
-            last_error = RuntimeError(f"OpenRouter augmentation failed: {exc}")
+            last_error = RuntimeError(f"{_llm_label(config)} augmentation failed: {exc}")
             if attempt < max_retries:
                 time.sleep(min(30.0, retry_base_seconds * attempt))
                 continue
             raise last_error from exc
     else:
-        raise RuntimeError(f"OpenRouter augmentation failed: {last_error}")
+        raise RuntimeError(f"{_llm_label(config)} augmentation failed: {last_error}")
     content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
     return _extract_json_object(str(content)), {
         "sent": True,
+        "provider": config.get("llm_provider"),
         "endpoint": endpoint,
         "request_body": body,
         "response_usage": payload.get("usage"),
         "response_model": payload.get("model"),
         "response_provider": payload.get("provider"),
         "response_id": payload.get("id"),
-        "model_verified": payload.get("model") in (None, OPENROUTER_REQUIRED_MODEL),
-        "fallbacks_allowed": False,
+        "model_verified": payload.get("model") in (None, config["llm_model"]),
+        "fallbacks_allowed": config.get("llm_provider") != "openrouter",
     }
 
 
@@ -424,9 +475,11 @@ def _llm_es_query_plan(
     query_text: str,
     table_context: dict[str, Any],
     human_guidance: str | None,
+    llm_config: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, str | None, dict[str, Any]]:
     guidance = (human_guidance or "").strip()
-    if not guidance and not os.environ.get("OPENROUTER_API_KEY", "").strip():
+    config = normalize_experiment_config(llm_config or {})
+    if not guidance and (not config.get("llm_enabled") or not _llm_api_key(config)):
         return {
             "optimized_query": query_text,
             "normalized_mention": None,
@@ -442,7 +495,7 @@ def _llm_es_query_plan(
             "typo_correction_reason": None,
         }, "heuristic", None, {
             "sent": False,
-            "reason": "OPENROUTER_API_KEY is not configured and no human guidance was provided",
+            "reason": "LLM is disabled or the API key is not configured, and no human guidance was provided",
         }
     messages = [
         {
@@ -487,23 +540,14 @@ def _llm_es_query_plan(
     ]
     llm_request = {
         "sent": False,
-        "endpoint": os.environ.get("OPENROUTER_CHAT_URL", "https://openrouter.ai/api/v1/chat/completions"),
-        "request_body": {
-            "model": OPENROUTER_REQUIRED_MODEL,
-            "temperature": float(os.environ.get("OPENROUTER_TEMPERATURE", "0.1")),
-            "response_format": {"type": "json_object"},
-            "include_reasoning": False,
-            "reasoning": {"effort": "high"},
-            "provider": {"order": [OPENROUTER_REQUIRED_PROVIDER], "allow_fallbacks": False},
-            "messages": messages,
-        },
+        "provider": config.get("llm_provider"),
+        "endpoint": _llm_endpoint(config),
+        "request_body": _llm_request_body(messages, config),
     }
-    if os.environ.get("OPENROUTER_MAX_TOKENS"):
-        llm_request["request_body"]["max_tokens"] = int(os.environ["OPENROUTER_MAX_TOKENS"])
     try:
-        parsed, llm_request = _openrouter_json_request(messages)
+        parsed, llm_request = _llm_json_request(messages, config)
         plan = _normalize_retrieval_signal_plan(parsed, query_text)
-        return plan, "openrouter_query_plan", None, llm_request
+        return plan, f"{config.get('llm_provider') or 'llm'}_query_plan", None, llm_request
     except Exception as exc:
         llm_request["error"] = str(exc)
         if guidance:
@@ -696,11 +740,18 @@ def experiment_defaults() -> dict[str, Any]:
 
 @app.get("/api/config-status")
 def config_status() -> dict[str, Any]:
+    defaults = default_experiment_config()
+    llm_key_configured = bool(os.environ.get("LLM_API_KEY", "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip())
     return {
         "alpaca_configured": bool(alpaca_token()),
+        "llm_configured": llm_key_configured,
+        "llm_provider": defaults["llm_provider"],
+        "llm_provider_name": defaults["llm_provider_name"],
+        "llm_api_url": defaults["llm_api_url"],
+        "llm_model": defaults["llm_model"],
         "openrouter_configured": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
-        "openrouter_model": OPENROUTER_REQUIRED_MODEL,
-        "openrouter_provider": OPENROUTER_REQUIRED_PROVIDER,
+        "openrouter_model": defaults["openrouter_model"],
+        "openrouter_provider": defaults["openrouter_provider"],
         "openrouter_reasoning_effort": "high",
         "openrouter_allow_fallbacks": False,
         "alpaca_token_aliases": ["ALPACA_TOKEN", "ALPACA_AUTH_TOKEN", "ALPACA_TOKEN_AUTH"],
@@ -710,7 +761,7 @@ def config_status() -> dict[str, Any]:
 @app.post("/api/experiment-jobs")
 def start_experiment_job(request: ExperimentJobRequest) -> dict[str, Any]:
     try:
-        return create_experiment_job(request.config)
+        return _redact_job(create_experiment_job(request.config))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -728,7 +779,7 @@ def experiment_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[s
             """,
             (limit,),
         ).fetchall()
-    return list(rows)
+    return [_redact_job(dict(row)) for row in rows]
 
 
 @app.get("/api/experiment-jobs/{job_id}")
@@ -743,7 +794,7 @@ def experiment_job(job_id: int) -> dict[str, Any]:
             """,
             (job_id,),
         ).fetchone()
-    return _row_or_404(row, "Experiment job")
+    return _redact_job(_row_or_404(row, "Experiment job"))
 
 
 @app.delete("/api/experiment-jobs/failed")
@@ -1141,6 +1192,7 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
             query_text=query_text,
             table_context=table_context,
             human_guidance=request.human_guidance,
+            llm_config=request.llm_config,
         )
         context_text = _target_context_text(table_context)
         query_body = build_alpaca_query(

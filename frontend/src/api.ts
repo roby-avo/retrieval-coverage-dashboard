@@ -34,8 +34,22 @@ export type ExperimentConfig = {
   dataset_allowlist: string[];
   table_allowlist_by_dataset: Record<string, string[]>;
   max_tasks_per_llm_request: number;
+  llm_parallel_requests: number;
   openrouter_parallel_requests: number;
   max_workers: number;
+  llm_enabled: boolean;
+  llm_provider: string;
+  llm_provider_name: string;
+  llm_api_url: string;
+  llm_api_key: string;
+  llm_model: string;
+  llm_reasoning_effort: string;
+  llm_temperature: number;
+  llm_timeout_seconds: number;
+  llm_max_retries: number;
+  llm_site_url: string;
+  llm_app_name: string;
+  llm_max_tokens?: number | null;
   use_openrouter: boolean;
   use_heuristic_fallback_on_llm_failure: boolean;
   openrouter_model: string;
@@ -74,6 +88,11 @@ export type ExperimentJob = {
 
 export type ConfigStatus = {
   alpaca_configured: boolean;
+  llm_configured: boolean;
+  llm_provider?: string;
+  llm_provider_name?: string;
+  llm_api_url?: string;
+  llm_model?: string;
   openrouter_configured: boolean;
   alpaca_token_aliases: string[];
 };
@@ -308,7 +327,7 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     }),
-  liveAttempt: (mentionId: number, body: { candidate_count: number; query_text?: string; human_guidance?: string }) =>
+  liveAttempt: (mentionId: number, body: { candidate_count: number; query_text?: string; human_guidance?: string; llm_config?: Partial<ExperimentConfig> }) =>
     request<LiveAttempt>(`/api/mentions/${mentionId}/live-attempt`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

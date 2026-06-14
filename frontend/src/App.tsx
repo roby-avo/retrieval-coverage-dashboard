@@ -3,6 +3,8 @@ import {
   Activity,
   AlertCircle,
   BarChart3,
+  Check,
+  Clipboard,
   Database,
   ListChecks,
   Play,
@@ -42,8 +44,73 @@ const PAGE_SIZE = 100;
 const MAX_RETRIEVAL_CANDIDATES = 1000;
 const MAX_RETURNED_CANDIDATES = 1000;
 const CANDIDATE_PAGE_SIZE = 100;
-type WorkspaceView = "overview" | "mentions" | "monitor";
+const DEFAULT_TABLE_SAMPLE_SIZE = 5;
+const DEFAULT_RECORD_SAMPLE_SIZE = 10;
+const LLM_SETTINGS_STORAGE_KEY = "coverage-dashboard-llm-settings";
+const LLM_SETTING_KEYS = [
+  "llm_enabled",
+  "llm_provider",
+  "llm_provider_name",
+  "llm_api_url",
+  "llm_api_key",
+  "llm_model",
+  "llm_reasoning_effort",
+  "llm_temperature",
+  "llm_timeout_seconds",
+  "llm_max_retries",
+  "llm_site_url",
+  "llm_app_name",
+  "llm_max_tokens",
+  "llm_parallel_requests",
+  "use_heuristic_fallback_on_llm_failure"
+] as const;
+type WorkspaceView = "overview" | "mentions" | "monitor" | "settings";
 type InspectorTab = "overview" | "live" | "candidates" | "inspection" | "feedback";
+type LlmSettingKey = (typeof LLM_SETTING_KEYS)[number];
+type LlmSettings = Pick<ExperimentConfig, LlmSettingKey>;
+
+function loadSavedLlmSettings(): Partial<LlmSettings> {
+  try {
+    const raw = window.localStorage.getItem(LLM_SETTINGS_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function llmSettingsFromConfig(config: ExperimentConfig): LlmSettings {
+  return {
+    llm_enabled: config.llm_enabled,
+    llm_provider: config.llm_provider,
+    llm_provider_name: config.llm_provider_name,
+    llm_api_url: config.llm_api_url,
+    llm_api_key: config.llm_api_key,
+    llm_model: config.llm_model,
+    llm_reasoning_effort: config.llm_reasoning_effort,
+    llm_temperature: config.llm_temperature,
+    llm_timeout_seconds: config.llm_timeout_seconds,
+    llm_max_retries: config.llm_max_retries,
+    llm_site_url: config.llm_site_url,
+    llm_app_name: config.llm_app_name,
+    llm_max_tokens: config.llm_max_tokens,
+    llm_parallel_requests: config.llm_parallel_requests,
+    use_heuristic_fallback_on_llm_failure: config.use_heuristic_fallback_on_llm_failure
+  };
+}
+
+function applyLlmSettings(config: ExperimentConfig, saved: Partial<LlmSettings>): ExperimentConfig {
+  const next = { ...config, ...saved };
+  next.use_openrouter = next.llm_enabled;
+  next.openrouter_parallel_requests = next.llm_parallel_requests;
+  next.openrouter_model = next.llm_model;
+  next.openrouter_provider = next.llm_provider_name;
+  return next;
+}
+
+function providerDisplayName(config: ExperimentConfig | null): string {
+  if (!config?.llm_enabled) return "Heuristic";
+  return config.llm_provider_name || (config.llm_provider === "openai_compatible" ? "OpenAI-compatible" : config.llm_provider || "LLM");
+}
 
 function pct(value: number | undefined | null): string {
   if (value === undefined || value === null || Number.isNaN(value)) return "-";
@@ -115,13 +182,32 @@ function jobProgress(job: ExperimentJob): number {
   return Math.max(2, Math.min(100, Math.round((job.progress_current / job.progress_total) * 100)));
 }
 
-function estimateMentions(config: ExperimentConfig | null): number | null {
+function matchingSourceDatasets(config: ExperimentConfig, sourceDatasets: SourceDataset[]): SourceDataset[] {
+  const targets = config.dataset_allowlist ?? [];
+  const requested = config.requested_datasets ?? [];
+  const ids = targets.length ? targets : requested;
+  if (!sourceDatasets.length || !ids.length) return sourceDatasets;
+  const allowed = new Set(ids);
+  return sourceDatasets.filter((dataset) => allowed.has(dataset.dataset_id));
+}
+
+function estimateMentions(config: ExperimentConfig | null, sourceDatasets: SourceDataset[] = []): number | null {
   if (!config) return null;
   const targetedDatasets = config.dataset_allowlist?.length ?? 0;
   const requestedDatasets = config.requested_datasets?.length ?? 0;
-  const availableDatasets = targetedDatasets || requestedDatasets || config.dataset_sample_size;
+  const matchingDatasets = matchingSourceDatasets(config, sourceDatasets);
+  const availableDatasets = matchingDatasets.length || targetedDatasets || requestedDatasets || config.dataset_sample_size;
   const datasetCount = config.dataset_sample_size > 0 ? Math.min(config.dataset_sample_size, availableDatasets) : availableDatasets;
+  if (matchingDatasets.length && config.tables_per_dataset <= 0 && config.records_per_table <= 0) {
+    const selectedDatasets = matchingDatasets.slice(0, datasetCount || matchingDatasets.length);
+    return selectedDatasets.reduce((total, dataset) => total + Number(dataset.mention_count || 0), 0);
+  }
   return datasetCount * config.tables_per_dataset * config.records_per_table;
+}
+
+function isEntireTargetDatasetRun(config: ExperimentConfig | null): boolean {
+  if (!config) return false;
+  return (config.dataset_allowlist?.length ?? 0) === 1 && config.tables_per_dataset <= 0 && config.records_per_table <= 0;
 }
 
 function experimentDatasetLabel(config: ExperimentConfig): string {
@@ -169,6 +255,7 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [jobBusy, setJobBusy] = useState(false);
+  const [settingsSaved, setSettingsSaved] = useState("");
 
   async function refreshRuns(nextRunId?: number) {
     const [runRows, jobRows, dbSize] = await Promise.all([api.runs(), api.experimentJobs(), api.databaseSize()]);
@@ -212,7 +299,7 @@ export default function App() {
   useEffect(() => {
     Promise.all([
       refreshRuns(),
-      api.experimentDefaults().then(setExperimentConfig),
+      api.experimentDefaults().then((config) => setExperimentConfig(applyLlmSettings(config, loadSavedLlmSettings()))),
       api.configStatus().then(setConfigStatus),
       api.sourceDatasets().then(setSourceDatasets),
       api.databaseSize().then(setDatabaseSize)
@@ -257,24 +344,92 @@ export default function App() {
     [coverage]
   );
 
-  const estimatedMentions = estimateMentions(experimentConfig);
+  const estimatedMentions = estimateMentions(experimentConfig, sourceDatasets);
+  const entireTargetDatasetRun = isEntireTargetDatasetRun(experimentConfig);
 
   function updateExperimentConfig<K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) {
-    setExperimentConfig((current) => (current ? { ...current, [key]: value } : current));
+    setExperimentConfig((current) => {
+      if (!current) return current;
+      const next = { ...current, [key]: value };
+      if (key === "llm_enabled") {
+        next.use_openrouter = Boolean(value);
+      }
+      if (key === "llm_parallel_requests") {
+        next.openrouter_parallel_requests = Number(value);
+      }
+      if (key === "llm_model") {
+        next.openrouter_model = String(value);
+      }
+      if (key === "llm_provider_name") {
+        next.openrouter_provider = String(value);
+      }
+      return next;
+    });
+    if (LLM_SETTING_KEYS.includes(key as LlmSettingKey)) setSettingsSaved("");
+  }
+
+  function saveLlmSettings() {
+    if (!experimentConfig) return;
+    window.localStorage.setItem(LLM_SETTINGS_STORAGE_KEY, JSON.stringify(llmSettingsFromConfig(experimentConfig)));
+    setSettingsSaved("LLM settings saved for this browser");
+  }
+
+  function useOpenRouterPreset() {
+    updateExperimentConfig("llm_enabled", true);
+    updateExperimentConfig("llm_provider", "openrouter");
+    updateExperimentConfig("llm_provider_name", "Cerebras");
+    updateExperimentConfig("llm_api_url", "https://openrouter.ai/api/v1/chat/completions");
+    updateExperimentConfig("llm_model", "openai/gpt-oss-120b");
+  }
+
+  function useOpenAiCompatiblePreset() {
+    updateExperimentConfig("llm_enabled", true);
+    updateExperimentConfig("llm_provider", "openai_compatible");
+    updateExperimentConfig("llm_provider_name", "On premise");
   }
 
   function updateTargetDataset(datasetId: string) {
     setExperimentConfig((current) => {
       if (!current) return current;
       if (!datasetId) {
-        return { ...current, dataset_allowlist: [] };
+        return {
+          ...current,
+          dataset_allowlist: [],
+          tables_per_dataset: current.tables_per_dataset > 0 ? current.tables_per_dataset : DEFAULT_TABLE_SAMPLE_SIZE,
+          records_per_table: current.records_per_table > 0 ? current.records_per_table : DEFAULT_RECORD_SAMPLE_SIZE
+        };
       }
       return { ...current, dataset_allowlist: [datasetId], dataset_sample_size: 1 };
     });
   }
 
+  function updateEntireDataset(enabled: boolean) {
+    setExperimentConfig((current) => {
+      if (!current) return current;
+      if (enabled) {
+        return { ...current, tables_per_dataset: 0, records_per_table: 0 };
+      }
+      return {
+        ...current,
+        tables_per_dataset: current.tables_per_dataset > 0 ? current.tables_per_dataset : DEFAULT_TABLE_SAMPLE_SIZE,
+        records_per_table: current.records_per_table > 0 ? current.records_per_table : DEFAULT_RECORD_SAMPLE_SIZE
+      };
+    });
+  }
+
   async function startExperiment() {
     if (!experimentConfig) return;
+    if (isEntireTargetDatasetRun(experimentConfig)) {
+      const datasetId = experimentConfig.dataset_allowlist[0];
+      const mentionCount = estimateMentions(experimentConfig, sourceDatasets) ?? 0;
+      const candidateSlots = mentionCount * experimentConfig.max_candidates;
+      const confirmed = window.confirm(
+        `Run the entire ${datasetId} dataset?\n\nThis will process ${compactNumber(mentionCount)} mentions with a retrieval window of ${compactNumber(
+          experimentConfig.max_candidates
+        )}, for up to ${compactNumber(candidateSlots)} candidate checks before filtering/import limits.\n\nContinue?`
+      );
+      if (!confirmed) return;
+    }
     setJobBusy(true);
     setStatus("Starting background experiment");
     setError("");
@@ -346,8 +501,8 @@ export default function App() {
                 <span className={`config-chip ${configStatus?.alpaca_configured ? "ok" : "warn"}`}>
                   Alpaca {configStatus?.alpaca_configured ? "ready" : "token missing"}
                 </span>
-                <span className={`config-chip ${configStatus?.openrouter_configured ? "ok" : "warn"}`}>
-                  OpenRouter {configStatus?.openrouter_configured ? "ready" : "optional/missing"}
+                <span className={`config-chip ${experimentConfig.llm_api_key || configStatus?.llm_configured ? "ok" : "warn"}`}>
+                  {providerDisplayName(experimentConfig)} {experimentConfig.llm_api_key || configStatus?.llm_configured ? "ready" : "key missing"}
                 </span>
               </div>
               <label>
@@ -368,6 +523,15 @@ export default function App() {
                     </option>
                   ))}
                 </select>
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  disabled={!experimentConfig.dataset_allowlist?.length}
+                  checked={entireTargetDatasetRun}
+                  onChange={(event) => updateEntireDataset(event.target.checked)}
+                />
+                Entire dataset
               </label>
               <div className="config-grid">
                 <label>
@@ -407,6 +571,7 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
+                    disabled={entireTargetDatasetRun}
                     value={experimentConfig.tables_per_dataset}
                     onChange={(event) => updateExperimentConfig("tables_per_dataset", Number(event.target.value))}
                   />
@@ -416,6 +581,7 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
+                    disabled={entireTargetDatasetRun}
                     value={experimentConfig.records_per_table}
                     onChange={(event) => updateExperimentConfig("records_per_table", Number(event.target.value))}
                   />
@@ -456,22 +622,22 @@ export default function App() {
                     />
                   </label>
                   <label>
-                    OpenRouter parallel
+                    LLM parallel
                     <input
                       type="number"
                       min={1}
                       max={16}
-                      value={experimentConfig.openrouter_parallel_requests}
-                      onChange={(event) => updateExperimentConfig("openrouter_parallel_requests", Number(event.target.value))}
+                      value={experimentConfig.llm_parallel_requests}
+                      onChange={(event) => updateExperimentConfig("llm_parallel_requests", Number(event.target.value))}
                     />
                   </label>
                   <label className="checkbox-row">
                     <input
                       type="checkbox"
-                      checked={experimentConfig.use_openrouter}
-                      onChange={(event) => updateExperimentConfig("use_openrouter", event.target.checked)}
+                      checked={experimentConfig.llm_enabled}
+                      onChange={(event) => updateExperimentConfig("llm_enabled", event.target.checked)}
                     />
-                    OpenRouter
+                    LLM query planner
                   </label>
                   <label className="checkbox-row">
                     <input
@@ -505,7 +671,7 @@ export default function App() {
               </button>
             </>
           )}
-          <JobList jobs={jobs} onOpenRun={(runId) => runId && refreshRuns(runId)} onClearFailed={clearFailedJobs} />
+          <JobList jobs={jobs} sourceDatasets={sourceDatasets} onOpenRun={(runId) => runId && refreshRuns(runId)} onClearFailed={clearFailedJobs} />
         </section>
 
         <section className="panel">
@@ -592,6 +758,10 @@ export default function App() {
             <Activity size={16} />
             Run Monitor
           </button>
+          <button className={workspaceView === "settings" ? "active" : ""} onClick={() => setWorkspaceView("settings")}>
+            <Settings2 size={16} />
+            Settings
+          </button>
         </nav>
 
         {workspaceView === "overview" && (
@@ -641,7 +811,19 @@ export default function App() {
         )}
 
         {workspaceView === "monitor" && (
-          <RunMonitor jobs={jobs} onOpenRun={(runId) => runId && refreshRuns(runId)} />
+          <RunMonitor jobs={jobs} sourceDatasets={sourceDatasets} onOpenRun={(runId) => runId && refreshRuns(runId)} />
+        )}
+
+        {workspaceView === "settings" && experimentConfig && (
+          <SettingsPanel
+            config={experimentConfig}
+            configStatus={configStatus}
+            savedMessage={settingsSaved}
+            onChange={updateExperimentConfig}
+            onSave={saveLlmSettings}
+            onOpenRouterPreset={useOpenRouterPreset}
+            onOpenAiCompatiblePreset={useOpenAiCompatiblePreset}
+          />
         )}
 
         {workspaceView === "mentions" && (
@@ -723,6 +905,7 @@ export default function App() {
 
             <MentionInspector
               detail={detail}
+              llmConfig={experimentConfig ? llmSettingsFromConfig(experimentConfig) : undefined}
               onRefresh={async () => {
                 if (detail) {
                   setDetail(await api.mention(detail.mention.id));
@@ -736,12 +919,173 @@ export default function App() {
   );
 }
 
+function SettingsPanel({
+  config,
+  configStatus,
+  savedMessage,
+  onChange,
+  onSave,
+  onOpenRouterPreset,
+  onOpenAiCompatiblePreset
+}: {
+  config: ExperimentConfig;
+  configStatus: ConfigStatus | null;
+  savedMessage: string;
+  onChange: <K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) => void;
+  onSave: () => void;
+  onOpenRouterPreset: () => void;
+  onOpenAiCompatiblePreset: () => void;
+}) {
+  const keyReady = Boolean(config.llm_api_key || configStatus?.llm_configured);
+  return (
+    <section className="settings-grid">
+      <div className="panel settings-main">
+        <div className="panel-title">
+          <Settings2 size={17} />
+          LLM Provider
+        </div>
+        <div className="settings-actions">
+          <button type="button" onClick={onOpenRouterPreset}>OpenRouter preset</button>
+          <button type="button" onClick={onOpenAiCompatiblePreset}>On-prem preset</button>
+        </div>
+        <div className="settings-form">
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={config.llm_enabled}
+              onChange={(event) => onChange("llm_enabled", event.target.checked)}
+            />
+            Use LLM query planner
+          </label>
+          <label>
+            Provider type
+            <select value={config.llm_provider} onChange={(event) => onChange("llm_provider", event.target.value)}>
+              <option value="openrouter">OpenRouter</option>
+              <option value="openai_compatible">OpenAI-compatible</option>
+              <option value="none">Heuristic only</option>
+            </select>
+          </label>
+          <label>
+            Provider label
+            <input value={config.llm_provider_name} placeholder="On premise" onChange={(event) => onChange("llm_provider_name", event.target.value)} />
+          </label>
+          <label>
+            Chat completions URL
+            <input
+              value={config.llm_api_url}
+              placeholder="http://localhost:8000/v1/chat/completions"
+              onChange={(event) => onChange("llm_api_url", event.target.value)}
+            />
+          </label>
+          <label>
+            API key
+            <input
+              type="password"
+              value={config.llm_api_key}
+              placeholder={configStatus?.llm_configured ? "Configured on server" : "Paste provider API key"}
+              onChange={(event) => onChange("llm_api_key", event.target.value)}
+            />
+          </label>
+          <label>
+            Model
+            <input value={config.llm_model} placeholder="local-model-name" onChange={(event) => onChange("llm_model", event.target.value)} />
+          </label>
+          <div className="config-grid">
+            <label>
+              Parallel requests
+              <input
+                type="number"
+                min={1}
+                max={16}
+                value={config.llm_parallel_requests}
+                onChange={(event) => onChange("llm_parallel_requests", Number(event.target.value))}
+              />
+            </label>
+            <label>
+              Temperature
+              <input
+                type="number"
+                min={0}
+                max={2}
+                step={0.1}
+                value={config.llm_temperature}
+                onChange={(event) => onChange("llm_temperature", Number(event.target.value))}
+              />
+            </label>
+            <label>
+              Timeout seconds
+              <input
+                type="number"
+                min={1}
+                value={config.llm_timeout_seconds}
+                onChange={(event) => onChange("llm_timeout_seconds", Number(event.target.value))}
+              />
+            </label>
+            <label>
+              Max retries
+              <input
+                type="number"
+                min={1}
+                value={config.llm_max_retries}
+                onChange={(event) => onChange("llm_max_retries", Number(event.target.value))}
+              />
+            </label>
+          </div>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={config.use_heuristic_fallback_on_llm_failure}
+              onChange={(event) => onChange("use_heuristic_fallback_on_llm_failure", event.target.checked)}
+            />
+            Fallback to heuristic plans on LLM errors
+          </label>
+          <div className="settings-actions">
+            <button className="primary" type="button" onClick={onSave}>
+              <Check size={16} />
+              Save settings
+            </button>
+            {savedMessage && <span className="settings-saved">{savedMessage}</span>}
+          </div>
+        </div>
+      </div>
+
+      <aside className="panel settings-side">
+        <div className="panel-title">Active Provider</div>
+        <div className="metadata-grid">
+          <div className="metadata-chip">
+            <span>Status</span>
+            <strong>{config.llm_enabled ? (keyReady ? "Ready" : "Key missing") : "Heuristic only"}</strong>
+          </div>
+          <div className="metadata-chip">
+            <span>Provider</span>
+            <strong>{providerDisplayName(config)}</strong>
+          </div>
+          <div className="metadata-chip">
+            <span>Model</span>
+            <strong>{config.llm_model || "-"}</strong>
+          </div>
+          <div className="metadata-chip">
+            <span>URL</span>
+            <strong title={config.llm_api_url}>{config.llm_api_url || "-"}</strong>
+          </div>
+        </div>
+        <div className={`note ${keyReady ? "success-note" : ""}`}>
+          <strong>{keyReady ? "API key available" : "API key needed"}</strong>
+          <span>{config.llm_api_key ? "Using the key saved in this browser." : configStatus?.llm_configured ? "Using the key configured on the API server." : "Paste a key above or set LLM_API_KEY/OPENROUTER_API_KEY on the API server."}</span>
+        </div>
+      </aside>
+    </section>
+  );
+}
+
 function JobList({
   jobs,
+  sourceDatasets,
   onOpenRun,
   onClearFailed
 }: {
   jobs: ExperimentJob[];
+  sourceDatasets: SourceDataset[];
   onOpenRun: (runId?: number) => void;
   onClearFailed: () => void;
 }) {
@@ -764,7 +1108,7 @@ function JobList({
         const total = job.progress_total || 0;
         const current = job.progress_current || 0;
         const progress = jobProgress(job);
-        const sampleCount = estimateMentions(job.config);
+        const sampleCount = estimateMentions(job.config, sourceDatasets);
         return (
           <div className={`job-card ${job.status}`} key={job.id}>
             <div className="job-row">
@@ -803,7 +1147,7 @@ function JobList({
   );
 }
 
-function RunMonitor({ jobs, onOpenRun }: { jobs: ExperimentJob[]; onOpenRun: (runId?: number) => void }) {
+function RunMonitor({ jobs, sourceDatasets, onOpenRun }: { jobs: ExperimentJob[]; sourceDatasets: SourceDataset[]; onOpenRun: (runId?: number) => void }) {
   const visibleJobs = jobs.slice(0, 8);
   return (
     <section className="monitor-grid">
@@ -826,7 +1170,7 @@ function RunMonitor({ jobs, onOpenRun }: { jobs: ExperimentJob[]; onOpenRun: (ru
             <JobStageBars job={job} />
             <div className="monitor-meta">
               <span>Seed {job.config.random_seed}</span>
-              <span>{compactNumber(estimateMentions(job.config))} mentions</span>
+              <span>{compactNumber(estimateMentions(job.config, sourceDatasets))} mentions</span>
               <span>top {compactNumber(job.config.max_candidates)} retrieval</span>
               {job.imported_run_id && <span>DB run {job.imported_run_id}</span>}
             </div>
@@ -1019,6 +1363,64 @@ function payloadString(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
+function promptContentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        const record = asRecord(part);
+        if (typeof record?.text === "string") return record.text;
+        if (typeof record?.content === "string") return record.content;
+        return payloadString(part);
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content === undefined || content === null) return "";
+  return payloadString(content);
+}
+
+function promptMessages(payload: unknown): unknown[] {
+  const record = asRecord(payload);
+  const requestBody = asRecord(record?.request_body) ?? record;
+  return Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+}
+
+function promptPlainText(messages: unknown[]): string {
+  if (!messages.length) return "";
+  return messages
+    .map((message, index) => {
+      const item = asRecord(message);
+      const role = cellText(item?.role || `message ${index + 1}`).toUpperCase();
+      const content = promptContentText(item?.content);
+      return `${role}:\n${content}`;
+    })
+    .join("\n\n");
+}
+
+function promptMessagesText(messages: unknown[]): string {
+  if (!messages.length) return "";
+  return `messages=${JSON.stringify(messages)}`;
+}
+
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textArea = document.createElement("textarea");
+  textArea.value = text;
+  textArea.style.position = "fixed";
+  textArea.style.left = "-9999px";
+  textArea.style.top = "0";
+  document.body.appendChild(textArea);
+  textArea.focus();
+  textArea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textArea);
+}
+
 function inspectionItems(detail: MentionDetail, latestAttempt: LiveAttempt | null): InspectionItem[] {
   const rawMention = detail.mention.raw_payload ?? {};
   const queryPlan = asRecord(rawMention.query_plan) ?? asRecord(asRecord(rawMention.retrieval_debug)?.query_plan);
@@ -1031,7 +1433,7 @@ function inspectionItems(detail: MentionDetail, latestAttempt: LiveAttempt | nul
   const items: InspectionItem[] = [
     {
       title: "Imported LLM Prompt",
-      subtitle: llmInspection?.sent === false ? "Prompt metadata available, but OpenRouter was not sent for this plan." : "OpenRouter query-plan request for this mention batch.",
+      subtitle: llmInspection?.sent === false ? "Prompt metadata available, but the LLM was not sent for this plan." : "LLM query-plan request for this mention batch.",
       status: cellText(queryPlan?.source ?? llmInspection?.sent ?? "not stored"),
       payload: llmInspection ?? queryPlan,
     },
@@ -1047,7 +1449,7 @@ function inspectionItems(detail: MentionDetail, latestAttempt: LiveAttempt | nul
     items.push(
       {
         title: "Live LLM Prompt",
-        subtitle: "OpenRouter request used to plan the live query terms.",
+        subtitle: "LLM request used to plan the live query terms.",
         status: cellText(asRecord(liveRequest?.llm_query_plan)?.sent ?? liveResponse?.query_plan_source ?? "not stored"),
         payload: liveRequest?.llm_query_plan ?? liveResponse?.llm_query_plan,
       },
@@ -1064,12 +1466,29 @@ function inspectionItems(detail: MentionDetail, latestAttempt: LiveAttempt | nul
 }
 
 function InspectionPanel({ items }: { items: InspectionItem[] }) {
+  const [copiedKey, setCopiedKey] = useState("");
+
+  async function copyPrompt(key: string, promptText: string) {
+    try {
+      await copyText(promptText);
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey((current) => (current === key ? "" : current)), 1600);
+    } catch {
+      setCopiedKey("");
+    }
+  }
+
   return (
     <section className="subsection grow">
       <div className="subhead">Inspection</div>
       <div className="inspection-list">
         {items.map((item) => {
           const body = payloadString(item.payload);
+          const messages = promptMessages(item.payload);
+          const promptText = promptPlainText(messages);
+          const messagesText = promptMessagesText(messages);
+          const plainCopyKey = `${item.title}:plain`;
+          const messagesCopyKey = `${item.title}:messages`;
           return (
             <details className="inspection-card" key={item.title}>
               <summary>
@@ -1079,6 +1498,26 @@ function InspectionPanel({ items }: { items: InspectionItem[] }) {
                 </span>
                 <b>{item.status || "-"}</b>
               </summary>
+              {promptText && (
+                <div className="prompt-debug">
+                  <div className="prompt-debug-head">
+                    <strong>Prompt Plain Text</strong>
+                    <div className="prompt-debug-actions">
+                      <button type="button" onClick={() => copyPrompt(plainCopyKey, promptText)}>
+                        {copiedKey === plainCopyKey ? <Check size={15} /> : <Clipboard size={15} />}
+                        {copiedKey === plainCopyKey ? "Copied" : "Copy plain"}
+                      </button>
+                      {messagesText && (
+                        <button type="button" onClick={() => copyPrompt(messagesCopyKey, messagesText)}>
+                          {copiedKey === messagesCopyKey ? <Check size={15} /> : <Clipboard size={15} />}
+                          {copiedKey === messagesCopyKey ? "Copied" : "Copy messages=[]"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <pre>{promptText}</pre>
+                </div>
+              )}
               {body ? <pre>{body}</pre> : <div className="muted metadata-empty">No inspection payload stored for this item.</div>}
             </details>
           );
@@ -1107,7 +1546,15 @@ function firstGoldCandidatePage(candidates: Candidate[]): number {
   return index >= 0 ? Math.floor(index / CANDIDATE_PAGE_SIZE) : 0;
 }
 
-function MentionInspector({ detail, onRefresh }: { detail: MentionDetail | null; onRefresh: () => Promise<void> }) {
+function MentionInspector({
+  detail,
+  llmConfig,
+  onRefresh
+}: {
+  detail: MentionDetail | null;
+  llmConfig?: Partial<ExperimentConfig>;
+  onRefresh: () => Promise<void>;
+}) {
   const [category, setCategory] = useState("miss_reason");
   const [note, setNote] = useState("");
   const [liveQuery, setLiveQuery] = useState("");
@@ -1162,7 +1609,8 @@ function MentionInspector({ detail, onRefresh }: { detail: MentionDetail | null;
       const result = await api.liveAttempt(activeDetail.mention.id, {
         candidate_count: candidateCount,
         query_text: liveQuery,
-        human_guidance: liveGuidance
+        human_guidance: liveGuidance,
+        llm_config: llmConfig
       });
       const resultCandidates = result.candidates ?? [];
       setLiveCandidates(resultCandidates);

@@ -39,4 +39,6 @@ Then run the app:
 docker compose up --build
 ```
 
+LLM query planning can be configured from the app's Settings tab. For server-side defaults, set `LLM_API_URL`, `LLM_API_KEY`, `LLM_MODEL`, and optionally `LLM_PROVIDER_NAME` in `.env`. On-prem OpenAI-compatible servers can use a `/v1/chat/completions` URL, for example `http://localhost:8000/v1/chat/completions`. Existing `OPENROUTER_*` variables still work as backward-compatible aliases.
+
 Postgres is configured for local trusted access in Docker Compose. The Adminer database client is available at `http://localhost:8082` by default and auto-connects to the local Postgres server as `postgres` without an Adminer or database password. Override `ADMINER_PORT` in `.env` if you want a different host port.

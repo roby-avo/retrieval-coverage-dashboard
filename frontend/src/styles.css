@@ -684,6 +684,48 @@ td span {
   background: var(--panel-soft);
 }
 
+.settings-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(28rem, 1fr) minmax(18rem, 24rem);
+  gap: 1rem;
+}
+
+.settings-main,
+.settings-side {
+  min-height: 0;
+  overflow: auto;
+}
+
+.settings-form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.settings-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.settings-actions button {
+  padding: 0 0.75rem;
+}
+
+.settings-saved {
+  color: var(--green);
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.settings-side {
+  display: grid;
+  align-content: start;
+  gap: 0.85rem;
+}
+
 .chart-wrap {
   height: 15rem;
 }
@@ -1065,16 +1107,60 @@ td span {
   font-weight: 760;
 }
 
-.inspection-card pre {
+.prompt-debug {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.65rem;
+  border-top: 1px solid var(--line);
+  background: #fff;
+}
+
+.prompt-debug-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.prompt-debug-head strong {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.prompt-debug-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.prompt-debug-actions button {
+  min-height: 1.95rem;
+  padding: 0 0.55rem;
+  white-space: nowrap;
+}
+
+.prompt-debug pre,
+.inspection-card > pre {
   max-height: 22rem;
   overflow: auto;
   margin: 0;
   padding: 0.7rem;
-  border-top: 1px solid var(--line);
   background: #0f172a;
   color: #e5e7eb;
   font-size: 0.72rem;
   white-space: pre-wrap;
+}
+
+.prompt-debug pre {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+  color: var(--ink);
+}
+
+.inspection-card > pre {
+  border-top: 1px solid var(--line);
 }
 
 .qid-list {
@@ -1217,7 +1303,8 @@ td span {
   }
 
   .split,
-  .analysis-grid {
+  .analysis-grid,
+  .settings-grid {
     grid-template-columns: 1fr;
   }
 }
