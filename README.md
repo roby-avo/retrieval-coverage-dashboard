@@ -39,6 +39,14 @@ Then run the app:
 docker compose up --build
 ```
 
+For a production-style run that exposes only the frontend, use:
+
+```bash
+docker compose -f docker-compose.prod.yml up --build
+```
+
+The UI is served at `http://localhost:5173` by default. Set `WEB_PORT` to publish a different host port; the API and Postgres services stay internal to the Compose network.
+
 LLM query planning is configured from the app's Settings tab. On-prem OpenAI-compatible servers can use a `/v1/chat/completions` URL, for example `http://localhost:8000/v1/chat/completions`.
 
 Postgres is configured for local trusted access in Docker Compose. The Adminer database client is available at `http://localhost:8082` by default and auto-connects to the local Postgres server as `postgres` without an Adminer or database password. Override `ADMINER_PORT` in `.env` if you want a different host port.
