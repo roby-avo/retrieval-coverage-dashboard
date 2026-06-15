@@ -20,7 +20,13 @@ Populate that metadata explicitly before starting experiments:
 ./scripts/seed_source_data.sh
 ```
 
-The script starts Postgres if needed, mounts `./Datasets` into the loader container, and stores discovery metadata in the database. It does not store table headers, table records, or ground-truth records. `source_tables` keeps file location, estimated row/column counts, file size, and per-table mention counts. Re-running the script imports newly added supported dataset directories while leaving already-populated metadata alone unless forced.
+The script starts Postgres if needed, mounts `./Datasets` into the loader container, and stores discovery metadata in the shared database volume used by both development and production Compose stacks. It defaults to the development stack. If the production stack is already running, target that Compose file explicitly:
+
+```bash
+./scripts/seed_source_data.sh --prod
+```
+
+It does not store table headers, table records, or ground-truth records. `source_tables` keeps file location, estimated row/column counts, file size, and per-table mention counts. Re-running the script imports newly added supported dataset directories while leaving already-populated metadata alone unless forced.
 
 During an experiment, the runner samples from Postgres metadata and reads only the selected ground-truth rows plus the small selected table row window from the stored source paths.
 
@@ -31,6 +37,8 @@ SOURCE_DATA_FORCE=1 ./scripts/seed_source_data.sh
 SOURCE_DATASETS=Round1_T2D,HardTablesR2 ./scripts/seed_source_data.sh
 SOURCE_DATASETS=all ./scripts/seed_source_data.sh
 DATASETS_DIR=/path/to/Datasets ./scripts/seed_source_data.sh
+SOURCE_DATA_FORCE=1 ./scripts/seed_source_data.sh --prod
+./scripts/seed_source_data.sh -f docker-compose.prod.yml
 ```
 
 Then run the app:

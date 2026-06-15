@@ -996,7 +996,10 @@ def run_experiment_job(job_id: int) -> None:
         sample_bundle = build_random_sample_bundle_from_db(config)
         samples = list(sample_bundle.get("samples") or [])
         if not samples:
-            raise RuntimeError("No source metadata found in Postgres. Run ./scripts/seed_source_data.sh to populate source_datasets and source_tables.")
+            raise RuntimeError(
+                "No source metadata found in Postgres. Run ./scripts/seed_source_data.sh for dev "
+                "or ./scripts/seed_source_data.sh --prod for production to populate source_datasets and source_tables."
+            )
         update_job(job_id, stage="sampled", progress_current=0, progress_total=len(samples), message=f"Sampled {len(samples)} mentions from filesystem-backed source metadata")
 
         set_stage_progress(
