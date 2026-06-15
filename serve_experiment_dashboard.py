@@ -235,12 +235,7 @@ def _post_json(url: str, payload: dict, headers: dict[str, str], *, timeout: int
 
 
 def _alpaca_token() -> str:
-    return (
-        os.environ.get("ALPACA_TOKEN")
-        or os.environ.get("ALPACA_AUTH_TOKEN")
-        or os.environ.get("ALPACA_TOKEN_AUTH")
-        or ""
-    ).strip()
+    return os.environ.get("ALPACA_TOKEN", "").strip()
 
 
 def _alpaca_search(query_body: dict, size: int) -> dict:

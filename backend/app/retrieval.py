@@ -39,12 +39,7 @@ SOFT_KEYWORD_BOOSTS = {
 
 
 def alpaca_token() -> str:
-    return (
-        os.environ.get("ALPACA_TOKEN")
-        or os.environ.get("ALPACA_AUTH_TOKEN")
-        or os.environ.get("ALPACA_TOKEN_AUTH")
-        or ""
-    ).strip()
+    return os.environ.get("ALPACA_TOKEN", "").strip()
 
 
 def _bounded_int(value: int | None, *, default: int, minimum: int, maximum: int) -> int:

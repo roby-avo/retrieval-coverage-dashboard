@@ -295,7 +295,7 @@ def _sampling_config(config: dict[str, Any], run_started_at: datetime) -> dict[s
         "openrouter_model": config["openrouter_model"],
         "openrouter_provider": config["openrouter_provider"],
         "openrouter_parallel_requests": config["openrouter_parallel_requests"],
-        "alpaca_search_endpoint": os.environ.get("ALPACA_SEARCH_ENDPOINT", ALPACA_METADATA_URL),
+        "alpaca_search_endpoint": ALPACA_METADATA_URL,
         "created_at": run_started_at.isoformat(),
         "source_storage": "filesystem_lazy",
         "run_storage": "postgres_incremental",
@@ -788,7 +788,7 @@ def _process_sample(sample: dict[str, Any], query_plan: dict[str, Any], config: 
         **query_body,
         "size": config["max_candidates"],
         "_inspection": {
-            "endpoint": os.environ.get("ALPACA_SEARCH_ENDPOINT", ALPACA_METADATA_URL),
+            "endpoint": ALPACA_METADATA_URL,
             "method": "POST",
             "candidate_count": config["max_candidates"],
             "optimized_query": query_plan.get("optimized_query"),

@@ -754,7 +754,6 @@ def config_status() -> dict[str, Any]:
         "openrouter_provider": defaults["openrouter_provider"],
         "openrouter_reasoning_effort": "high",
         "openrouter_allow_fallbacks": False,
-        "alpaca_token_aliases": ["ALPACA_TOKEN", "ALPACA_AUTH_TOKEN", "ALPACA_TOKEN_AUTH"],
     }
 
 

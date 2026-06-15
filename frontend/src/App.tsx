@@ -501,8 +501,8 @@ export default function App() {
                 <span className={`config-chip ${configStatus?.alpaca_configured ? "ok" : "warn"}`}>
                   Alpaca {configStatus?.alpaca_configured ? "ready" : "token missing"}
                 </span>
-                <span className={`config-chip ${experimentConfig.llm_api_key || configStatus?.llm_configured ? "ok" : "warn"}`}>
-                  {providerDisplayName(experimentConfig)} {experimentConfig.llm_api_key || configStatus?.llm_configured ? "ready" : "key missing"}
+                <span className={`config-chip ${experimentConfig.llm_api_key ? "ok" : "warn"}`}>
+                  {providerDisplayName(experimentConfig)} {experimentConfig.llm_api_key ? "ready" : "key missing"}
                 </span>
               </div>
               <label>
@@ -817,7 +817,6 @@ export default function App() {
         {workspaceView === "settings" && experimentConfig && (
           <SettingsPanel
             config={experimentConfig}
-            configStatus={configStatus}
             savedMessage={settingsSaved}
             onChange={updateExperimentConfig}
             onSave={saveLlmSettings}
@@ -921,7 +920,6 @@ export default function App() {
 
 function SettingsPanel({
   config,
-  configStatus,
   savedMessage,
   onChange,
   onSave,
@@ -929,14 +927,13 @@ function SettingsPanel({
   onOpenAiCompatiblePreset
 }: {
   config: ExperimentConfig;
-  configStatus: ConfigStatus | null;
   savedMessage: string;
   onChange: <K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) => void;
   onSave: () => void;
   onOpenRouterPreset: () => void;
   onOpenAiCompatiblePreset: () => void;
 }) {
-  const keyReady = Boolean(config.llm_api_key || configStatus?.llm_configured);
+  const keyReady = Boolean(config.llm_api_key);
   return (
     <section className="settings-grid">
       <div className="panel settings-main">
@@ -982,7 +979,7 @@ function SettingsPanel({
             <input
               type="password"
               value={config.llm_api_key}
-              placeholder={configStatus?.llm_configured ? "Configured on server" : "Paste provider API key"}
+              placeholder="Paste provider API key"
               onChange={(event) => onChange("llm_api_key", event.target.value)}
             />
           </label>
@@ -1071,7 +1068,7 @@ function SettingsPanel({
         </div>
         <div className={`note ${keyReady ? "success-note" : ""}`}>
           <strong>{keyReady ? "API key available" : "API key needed"}</strong>
-          <span>{config.llm_api_key ? "Using the key saved in this browser." : configStatus?.llm_configured ? "Using the key configured on the API server." : "Paste a key above or set LLM_API_KEY/OPENROUTER_API_KEY on the API server."}</span>
+          <span>{config.llm_api_key ? "Using the key saved in this browser." : "Paste a key above and save it in this browser."}</span>
         </div>
       </aside>
     </section>

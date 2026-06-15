@@ -94,7 +94,6 @@ export type ConfigStatus = {
   llm_api_url?: string;
   llm_model?: string;
   openrouter_configured: boolean;
-  alpaca_token_aliases: string[];
 };
 
 export type SourceDataset = {
