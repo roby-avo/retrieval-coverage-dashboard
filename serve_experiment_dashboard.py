@@ -22,7 +22,8 @@ ALPACA_METADATA_URL = os.environ.get(
 )
 OPENROUTER_CHAT_URL = os.environ.get("OPENROUTER_CHAT_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
-OPENROUTER_PROVIDER = os.environ.get("OPENROUTER_PROVIDER", "Cerebras")
+OPENROUTER_PROVIDER = os.environ.get("OPENROUTER_PROVIDER", "").strip()
+OPENROUTER_ALLOW_FALLBACKS = os.environ.get("OPENROUTER_ALLOW_FALLBACKS", "true").strip().casefold() not in {"0", "false", "no", "off"}
 OPENROUTER_MAX_TOKENS = os.environ.get("OPENROUTER_MAX_TOKENS")
 NER_TYPE_PAIRS = (
     ("PERSON", "PERSON"),
@@ -163,7 +164,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._send_json(
                 {
                     "model": OPENROUTER_MODEL,
-                    "provider": OPENROUTER_PROVIDER,
+                    "provider": OPENROUTER_PROVIDER or None,
                     "candidate_count": candidate_count,
                     "attempt_count": len(attempts),
                     "requested_attempt_count": attempt_count,
@@ -386,12 +387,14 @@ def _openrouter_chat(messages: list[dict]) -> str:
         raise ValueError("OPENROUTER_API_KEY is not configured")
     payload = {
         "model": OPENROUTER_MODEL,
-        "provider": {"order": [OPENROUTER_PROVIDER], "allow_fallbacks": False},
         "messages": messages,
         "temperature": 0.35,
         "include_reasoning": False,
         "response_format": {"type": "json_object"},
     }
+    if OPENROUTER_PROVIDER:
+        provider_slug = re.sub(r"\s+", "-", OPENROUTER_PROVIDER.casefold())
+        payload["provider"] = {"order": [provider_slug], "allow_fallbacks": OPENROUTER_ALLOW_FALLBACKS}
     if OPENROUTER_MAX_TOKENS:
         payload["max_tokens"] = _bounded_int(OPENROUTER_MAX_TOKENS, default=1200, minimum=256, maximum=8192)
     response = _post_json(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
+import threading
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -20,6 +22,7 @@ DEFAULT_RETRIEVAL_CANDIDATES = 100
 MAX_RETRIEVAL_CANDIDATES = 1000
 MAX_RETURNED_CANDIDATES = 1000
 TYPO_CORRECTION_CONFIDENCE_THRESHOLD = 0.85
+ALPACA_SEARCH_CACHE_MAX_ENTRIES = int(os.environ.get("ALPACA_SEARCH_CACHE_MAX_ENTRIES", "256"))
 
 TEXT_MATCH_FIELDS = [
     "label^6",
@@ -36,6 +39,9 @@ SOFT_KEYWORD_BOOSTS = {
     "wikipedia_url": 25.0,
     "dbpedia_url": 25.0,
 }
+
+_ALPACA_SEARCH_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
+_ALPACA_SEARCH_CACHE_LOCK = threading.Lock()
 
 
 def alpaca_token() -> str:
@@ -206,10 +212,55 @@ def build_alpaca_query(query_text: str, retrieval_signals: dict[str, Any] | None
     }
 
 
+def _alpaca_cache_key(query_body: dict[str, Any]) -> str:
+    payload = dict(query_body)
+    payload.pop("size", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _slice_alpaca_response(response: dict[str, Any], size: int) -> dict[str, Any]:
+    bounded_size = bounded_candidate_count(size)
+    result = copy.deepcopy(response)
+    hits = result.get("hits")
+    if isinstance(hits, dict) and isinstance(hits.get("hits"), list):
+        hits["hits"] = hits["hits"][:bounded_size]
+    return result
+
+
+def _cached_alpaca_response(cache_key: str, size: int) -> dict[str, Any] | None:
+    with _ALPACA_SEARCH_CACHE_LOCK:
+        cached = _ALPACA_SEARCH_CACHE.get(cache_key)
+    if not cached:
+        return None
+    cached_size, response = cached
+    if cached_size < bounded_candidate_count(size):
+        return None
+    return _slice_alpaca_response(response, size)
+
+
+def _store_alpaca_response(cache_key: str, size: int, response: dict[str, Any]) -> None:
+    if ALPACA_SEARCH_CACHE_MAX_ENTRIES <= 0:
+        return
+    bounded_size = bounded_candidate_count(size)
+    with _ALPACA_SEARCH_CACHE_LOCK:
+        existing = _ALPACA_SEARCH_CACHE.get(cache_key)
+        if existing and existing[0] >= bounded_size:
+            return
+        if len(_ALPACA_SEARCH_CACHE) >= ALPACA_SEARCH_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(_ALPACA_SEARCH_CACHE))
+            _ALPACA_SEARCH_CACHE.pop(oldest_key, None)
+        _ALPACA_SEARCH_CACHE[cache_key] = (bounded_size, copy.deepcopy(response))
+
+
 def alpaca_search(query_body: dict[str, Any], size: int) -> dict[str, Any]:
     token = alpaca_token()
     if not token:
         raise RuntimeError("ALPACA_TOKEN is not configured")
+
+    cache_key = _alpaca_cache_key(query_body)
+    cached_response = _cached_alpaca_response(cache_key, size)
+    if cached_response is not None:
+        return cached_response
 
     payload = dict(query_body)
     payload["size"] = bounded_candidate_count(size)
@@ -226,7 +277,9 @@ def alpaca_search(query_body: dict[str, Any], size: int) -> dict[str, Any]:
     )
     try:
         with urlopen(request, timeout=60) as response:
-            return json.loads(response.read() or b"{}")
+            response_payload = json.loads(response.read() or b"{}")
+            _store_alpaca_response(cache_key, payload["size"], response_payload)
+            return response_payload
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Alpaca HTTP {exc.code}: {detail}") from exc

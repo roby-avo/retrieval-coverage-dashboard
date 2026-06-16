@@ -52,6 +52,7 @@ export type ExperimentConfig = {
   llm_max_tokens?: number | null;
   use_openrouter: boolean;
   use_heuristic_fallback_on_llm_failure: boolean;
+  openrouter_allow_fallbacks: boolean;
   openrouter_model: string;
   openrouter_provider: string;
 };
@@ -94,6 +95,49 @@ export type ConfigStatus = {
   llm_api_url?: string;
   llm_model?: string;
   openrouter_configured: boolean;
+  openrouter_allow_fallbacks?: boolean;
+};
+
+export type LlmUsageEstimate = {
+  model: string;
+  provider?: string | null;
+  route_provider?: string | null;
+  estimation_method: string;
+  token_estimate: {
+    prompt_tokens: number;
+    max_completion_tokens?: number;
+    estimated_completion_tokens?: number;
+    completion_tokens_per_request?: number;
+    completion_token_source?: string;
+    total_tokens: number;
+  };
+  pricing_source?: string | null;
+  pricing?: {
+    prompt_per_token?: number | null;
+    completion_per_token?: number | null;
+    request?: number | null;
+    prompt_per_million?: number | null;
+    completion_per_million?: number | null;
+    estimated_prompt_cost_usd?: number | null;
+    estimated_completion_cost_usd?: number | null;
+    estimated_total_cost_usd?: number | null;
+  } | null;
+  model_info?: {
+    id?: string;
+    name?: string;
+    context_length?: number;
+    top_provider?: Record<string, unknown>;
+  } | null;
+  notes: string[];
+  target?: {
+    sampled_mentions: number;
+    llm_request_count: number;
+    max_tasks_per_llm_request: number;
+    dataset_inventory?: Array<Record<string, unknown>>;
+    sampling_manifest?: Array<Record<string, unknown>>;
+    warnings?: string[];
+  };
+  request_estimates?: Array<Record<string, unknown>>;
 };
 
 export type SourceDataset = {
@@ -325,6 +369,18 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
+    }),
+  estimateLlmUsage: (body: { input: string; model?: string; max_completion_tokens?: number | null; config?: Partial<ExperimentConfig> }) =>
+    request<LlmUsageEstimate>("/api/llm/estimate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }),
+  estimateExperiment: (config: Partial<ExperimentConfig>) =>
+    request<LlmUsageEstimate>("/api/experiment-estimate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config })
     }),
   liveAttempt: (mentionId: number, body: { candidate_count: number; query_text?: string; human_guidance?: string; llm_config?: Partial<ExperimentConfig> }) =>
     request<LiveAttempt>(`/api/mentions/${mentionId}/live-attempt`, {

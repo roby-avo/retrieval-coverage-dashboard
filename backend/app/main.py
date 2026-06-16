@@ -21,6 +21,7 @@ from .datasets import source_dataset_inventory
 from .db import connect, init_database
 from .experiment_runner import create_experiment_job, default_experiment_config
 from .experiment_runner import normalize_experiment_config
+from .llm_estimation import estimate_experiment_llm_usage, estimate_llm_usage
 from .retrieval import (
     ALPACA_METADATA_URL,
     MAX_RETURNED_CANDIDATES,
@@ -51,7 +52,6 @@ class FeedbackRequest(BaseModel):
 
 
 OPENROUTER_REQUIRED_MODEL = "openai/gpt-oss-120b"
-OPENROUTER_REQUIRED_PROVIDER = "Cerebras"
 TYPO_CORRECTION_CONFIDENCE_THRESHOLD = 0.85
 
 
@@ -63,6 +63,17 @@ class LiveAttemptRequest(BaseModel):
 
 
 class ExperimentJobRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class LlmEstimateRequest(BaseModel):
+    input: str = Field(default="", max_length=200000)
+    model: str | None = None
+    max_completion_tokens: int | None = Field(default=None, ge=0, le=200000)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperimentEstimateRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -349,6 +360,20 @@ def _llm_label(config: dict[str, Any]) -> str:
     return provider if provider.casefold() != "openai_compatible" else "OpenAI-compatible"
 
 
+def _openrouter_provider_slug(provider_name: Any) -> str:
+    return re.sub(r"\s+", "-", str(provider_name or "").strip().casefold())
+
+
+def _openrouter_provider_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    provider_slug = _openrouter_provider_slug(config.get("llm_provider_name"))
+    if not provider_slug:
+        return None
+    return {
+        "order": [provider_slug],
+        "allow_fallbacks": bool(config.get("openrouter_allow_fallbacks", True)),
+    }
+
+
 def _llm_request_body(messages: list[dict[str, str]], config: dict[str, Any]) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": config["llm_model"],
@@ -359,8 +384,9 @@ def _llm_request_body(messages: list[dict[str, str]], config: dict[str, Any]) ->
     if config.get("llm_provider") == "openrouter":
         body["include_reasoning"] = False
         body["reasoning"] = {"effort": config["llm_reasoning_effort"]}
-        if config.get("llm_provider_name"):
-            body["provider"] = {"order": [config["llm_provider_name"]], "allow_fallbacks": False}
+        provider_config = _openrouter_provider_config(config)
+        if provider_config:
+            body["provider"] = provider_config
     if config.get("llm_max_tokens") is not None:
         body["max_tokens"] = int(config["llm_max_tokens"])
     return body
@@ -753,8 +779,33 @@ def config_status() -> dict[str, Any]:
         "openrouter_model": defaults["openrouter_model"],
         "openrouter_provider": defaults["openrouter_provider"],
         "openrouter_reasoning_effort": "high",
-        "openrouter_allow_fallbacks": False,
+        "openrouter_allow_fallbacks": defaults["openrouter_allow_fallbacks"],
     }
+
+
+@app.post("/api/llm/estimate")
+def llm_estimate(request: LlmEstimateRequest) -> dict[str, Any]:
+    config = normalize_experiment_config({**request.config})
+    if request.model:
+        config["llm_model"] = request.model.strip()
+        config["openrouter_model"] = config["llm_model"]
+    try:
+        return estimate_llm_usage(
+            input_text=request.input,
+            config=config,
+            max_completion_tokens=request.max_completion_tokens,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/experiment-estimate")
+def experiment_estimate(request: ExperimentEstimateRequest) -> dict[str, Any]:
+    config = normalize_experiment_config(request.config)
+    try:
+        return estimate_experiment_llm_usage(config)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/experiment-jobs")

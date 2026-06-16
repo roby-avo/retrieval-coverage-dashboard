@@ -3,6 +3,7 @@ import {
   Activity,
   AlertCircle,
   BarChart3,
+  Calculator,
   Check,
   Clipboard,
   Database,
@@ -34,6 +35,7 @@ import {
   GoldMetadataResult,
   ImprovementDiagnostics,
   LiveAttempt,
+  LlmUsageEstimate,
   MentionDetail,
   MentionRow,
   Run,
@@ -62,7 +64,8 @@ const LLM_SETTING_KEYS = [
   "llm_app_name",
   "llm_max_tokens",
   "llm_parallel_requests",
-  "use_heuristic_fallback_on_llm_failure"
+  "use_heuristic_fallback_on_llm_failure",
+  "openrouter_allow_fallbacks"
 ] as const;
 type WorkspaceView = "overview" | "mentions" | "monitor" | "settings";
 type InspectorTab = "overview" | "live" | "candidates" | "inspection" | "feedback";
@@ -94,7 +97,8 @@ function llmSettingsFromConfig(config: ExperimentConfig): LlmSettings {
     llm_app_name: config.llm_app_name,
     llm_max_tokens: config.llm_max_tokens,
     llm_parallel_requests: config.llm_parallel_requests,
-    use_heuristic_fallback_on_llm_failure: config.use_heuristic_fallback_on_llm_failure
+    use_heuristic_fallback_on_llm_failure: config.use_heuristic_fallback_on_llm_failure,
+    openrouter_allow_fallbacks: config.openrouter_allow_fallbacks
   };
 }
 
@@ -104,12 +108,15 @@ function applyLlmSettings(config: ExperimentConfig, saved: Partial<LlmSettings>)
   next.openrouter_parallel_requests = next.llm_parallel_requests;
   next.openrouter_model = next.llm_model;
   next.openrouter_provider = next.llm_provider_name;
+  next.openrouter_allow_fallbacks = next.openrouter_allow_fallbacks ?? true;
   return next;
 }
 
 function providerDisplayName(config: ExperimentConfig | null): string {
   if (!config?.llm_enabled) return "Heuristic";
-  return config.llm_provider_name || (config.llm_provider === "openai_compatible" ? "OpenAI-compatible" : config.llm_provider || "LLM");
+  if (config.llm_provider_name) return config.llm_provider_name;
+  if (config.llm_provider === "openrouter") return "OpenRouter";
+  return config.llm_provider === "openai_compatible" ? "OpenAI-compatible" : config.llm_provider || "LLM";
 }
 
 function pct(value: number | undefined | null): string {
@@ -120,6 +127,13 @@ function pct(value: number | undefined | null): string {
 function compactNumber(value: number | undefined | null): string {
   if (value === undefined || value === null) return "-";
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+function compactUsd(value: number | undefined | null): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return "-";
+  if (value === 0) return "$0";
+  if (value < 0.0001) return `$${value.toExponential(2)}`;
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(value);
 }
 
 function formatBytes(value: number | undefined | null): string {
@@ -255,6 +269,9 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [jobBusy, setJobBusy] = useState(false);
+  const [estimateBusy, setEstimateBusy] = useState(false);
+  const [runEstimate, setRunEstimate] = useState<LlmUsageEstimate | null>(null);
+  const [estimateError, setEstimateError] = useState("");
   const [settingsSaved, setSettingsSaved] = useState("");
 
   async function refreshRuns(nextRunId?: number) {
@@ -348,6 +365,8 @@ export default function App() {
   const entireTargetDatasetRun = isEntireTargetDatasetRun(experimentConfig);
 
   function updateExperimentConfig<K extends keyof ExperimentConfig>(key: K, value: ExperimentConfig[K]) {
+    setRunEstimate(null);
+    setEstimateError("");
     setExperimentConfig((current) => {
       if (!current) return current;
       const next = { ...current, [key]: value };
@@ -374,12 +393,27 @@ export default function App() {
     setSettingsSaved("LLM settings saved for this browser");
   }
 
+  async function estimateExperimentCost() {
+    if (!experimentConfig) return;
+    setEstimateBusy(true);
+    setEstimateError("");
+    setRunEstimate(null);
+    try {
+      setRunEstimate(await api.estimateExperiment(experimentConfig));
+    } catch (exc) {
+      setEstimateError(readableError(exc));
+    } finally {
+      setEstimateBusy(false);
+    }
+  }
+
   function useOpenRouterPreset() {
     updateExperimentConfig("llm_enabled", true);
     updateExperimentConfig("llm_provider", "openrouter");
-    updateExperimentConfig("llm_provider_name", "Cerebras");
+    updateExperimentConfig("llm_provider_name", "");
     updateExperimentConfig("llm_api_url", "https://openrouter.ai/api/v1/chat/completions");
     updateExperimentConfig("llm_model", "openai/gpt-oss-120b");
+    updateExperimentConfig("openrouter_allow_fallbacks", true);
   }
 
   function useOpenAiCompatiblePreset() {
@@ -389,6 +423,8 @@ export default function App() {
   }
 
   function updateTargetDataset(datasetId: string) {
+    setRunEstimate(null);
+    setEstimateError("");
     setExperimentConfig((current) => {
       if (!current) return current;
       if (!datasetId) {
@@ -404,6 +440,8 @@ export default function App() {
   }
 
   function updateEntireDataset(enabled: boolean) {
+    setRunEstimate(null);
+    setEstimateError("");
     setExperimentConfig((current) => {
       if (!current) return current;
       if (enabled) {
@@ -665,6 +703,41 @@ export default function App() {
                   </label>
                 </div>
               </details>
+              <div className="run-estimate">
+                <button type="button" onClick={estimateExperimentCost} disabled={estimateBusy || !experimentConfig.llm_enabled}>
+                  <Calculator size={15} />
+                  {estimateBusy ? "Estimating..." : "Estimate LLM cost"}
+                </button>
+                {estimateError && <div className="error-box compact">{estimateError}</div>}
+                {runEstimate && (
+                  <div className="metadata-grid estimate-grid">
+                    <div className="metadata-chip">
+                      <span>Mentions</span>
+                      <strong>{compactNumber(runEstimate.target?.sampled_mentions)}</strong>
+                    </div>
+                    <div className="metadata-chip">
+                      <span>LLM requests</span>
+                      <strong>{compactNumber(runEstimate.target?.llm_request_count)}</strong>
+                    </div>
+                    <div className="metadata-chip">
+                      <span>Input tokens</span>
+                      <strong>{compactNumber(runEstimate.token_estimate.prompt_tokens)}</strong>
+                    </div>
+                    <div className="metadata-chip">
+                      <span>Output est.</span>
+                      <strong>{compactNumber(runEstimate.token_estimate.estimated_completion_tokens ?? runEstimate.token_estimate.max_completion_tokens)}</strong>
+                    </div>
+                    <div className="metadata-chip">
+                      <span>Total tokens</span>
+                      <strong>{compactNumber(runEstimate.token_estimate.total_tokens)}</strong>
+                    </div>
+                    <div className="metadata-chip">
+                      <span>Est. cost</span>
+                      <strong>{compactUsd(runEstimate.pricing?.estimated_total_cost_usd)}</strong>
+                    </div>
+                  </div>
+                )}
+              </div>
               <button className="primary" disabled={jobBusy} onClick={startExperiment}>
                 <Play size={16} />
                 {jobBusy ? "Starting..." : "Start background run"}
@@ -963,9 +1036,23 @@ function SettingsPanel({
             </select>
           </label>
           <label>
-            Provider label
-            <input value={config.llm_provider_name} placeholder="On premise" onChange={(event) => onChange("llm_provider_name", event.target.value)} />
+            {config.llm_provider === "openrouter" ? "OpenRouter route provider" : "Provider label"}
+            <input
+              value={config.llm_provider_name}
+              placeholder={config.llm_provider === "openrouter" ? "Optional: cerebras, fireworks, ..." : "On premise"}
+              onChange={(event) => onChange("llm_provider_name", event.target.value)}
+            />
           </label>
+          {config.llm_provider === "openrouter" && (
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={config.openrouter_allow_fallbacks}
+                onChange={(event) => onChange("openrouter_allow_fallbacks", event.target.checked)}
+              />
+              Allow OpenRouter provider fallbacks
+            </label>
+          )}
           <label>
             Chat completions URL
             <input

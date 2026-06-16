@@ -40,7 +40,7 @@ DEFAULT_DATASETS = [
     "Round4_2020",
 ]
 OPENROUTER_REQUIRED_MODEL = "openai/gpt-oss-120b"
-OPENROUTER_REQUIRED_PROVIDER = "Cerebras"
+DEFAULT_OPENROUTER_PROVIDER = ""
 DEFAULT_LLM_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 TYPO_CORRECTION_CONFIDENCE_THRESHOLD = 0.85
 STOPWORDS = {"a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "is", "of", "on", "or", "the", "to", "with"}
@@ -59,7 +59,7 @@ def _job_name(job_id: int, config: dict[str, Any]) -> str:
 
 def default_experiment_config() -> dict[str, Any]:
     llm_provider = os.environ.get("LLM_PROVIDER", "openrouter").strip() or "openrouter"
-    llm_provider_name = os.environ.get("LLM_PROVIDER_NAME", os.environ.get("OPENROUTER_PROVIDER", OPENROUTER_REQUIRED_PROVIDER)).strip()
+    llm_provider_name = os.environ.get("LLM_PROVIDER_NAME", os.environ.get("OPENROUTER_PROVIDER", DEFAULT_OPENROUTER_PROVIDER)).strip()
     llm_model = os.environ.get("LLM_MODEL", os.environ.get("OPENROUTER_MODEL", OPENROUTER_REQUIRED_MODEL)).strip()
     llm_api_url = os.environ.get("LLM_API_URL", os.environ.get("OPENROUTER_CHAT_URL", DEFAULT_LLM_CHAT_URL)).strip()
     llm_parallel_requests = int(os.environ.get("LLM_PARALLEL_REQUESTS", os.environ.get("OPENROUTER_PARALLEL_REQUESTS", "2")))
@@ -100,6 +100,7 @@ def default_experiment_config() -> dict[str, Any]:
         "llm_site_url": os.environ.get("LLM_SITE_URL", os.environ.get("OPENROUTER_SITE_URL", "http://localhost")),
         "llm_app_name": os.environ.get("LLM_APP_NAME", os.environ.get("OPENROUTER_APP_NAME", "alpaca-random-coverage-sampler")),
         "llm_max_tokens": int(os.environ["LLM_MAX_TOKENS"]) if os.environ.get("LLM_MAX_TOKENS") else int(os.environ["OPENROUTER_MAX_TOKENS"]) if os.environ.get("OPENROUTER_MAX_TOKENS") else None,
+        "openrouter_allow_fallbacks": True,
         "use_openrouter": True,
         "use_heuristic_fallback_on_llm_failure": True,
         "openrouter_parallel_requests": llm_parallel_requests,
@@ -164,7 +165,7 @@ def normalize_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
     merged["llm_model"] = str(merged.get("llm_model") or merged.get("openrouter_model") or OPENROUTER_REQUIRED_MODEL).strip()
     merged["llm_reasoning_effort"] = str(merged.get("llm_reasoning_effort") or merged.get("openrouter_reasoning_effort") or "high").strip()
     merged["openrouter_model"] = merged["llm_model"]
-    merged["openrouter_provider"] = merged["llm_provider_name"] or OPENROUTER_REQUIRED_PROVIDER
+    merged["openrouter_provider"] = merged["llm_provider_name"]
     merged["openrouter_reasoning_effort"] = merged["llm_reasoning_effort"]
     for next_key, legacy_key in (
         ("llm_temperature", "openrouter_temperature"),
@@ -208,6 +209,7 @@ def normalize_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
         "llm_enabled",
         "use_openrouter",
         "use_heuristic_fallback_on_llm_failure",
+        "openrouter_allow_fallbacks",
     ):
         merged[key] = bool(merged.get(key))
     return merged
@@ -274,6 +276,20 @@ def _llm_label(config: dict[str, Any]) -> str:
         return "Heuristic"
     provider = str(config.get("llm_provider_name") or config.get("llm_provider") or "LLM").strip()
     return provider if provider.casefold() != "openai_compatible" else "OpenAI-compatible"
+
+
+def _openrouter_provider_slug(provider_name: Any) -> str:
+    return re.sub(r"\s+", "-", str(provider_name or "").strip().casefold())
+
+
+def _openrouter_provider_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    provider_slug = _openrouter_provider_slug(config.get("llm_provider_name"))
+    if not provider_slug:
+        return None
+    return {
+        "order": [provider_slug],
+        "allow_fallbacks": bool(config.get("openrouter_allow_fallbacks", True)),
+    }
 
 
 def _sampling_config(config: dict[str, Any], run_started_at: datetime) -> dict[str, Any]:
@@ -568,8 +584,9 @@ def _llm_batch_body(samples: Sequence[dict[str, Any]], config: dict[str, Any]) -
     if config.get("llm_provider") == "openrouter":
         body["include_reasoning"] = False
         body["reasoning"] = {"effort": config["llm_reasoning_effort"]}
-        if config.get("llm_provider_name"):
-            body["provider"] = {"order": [config["llm_provider_name"]], "allow_fallbacks": False}
+        provider_config = _openrouter_provider_config(config)
+        if provider_config:
+            body["provider"] = provider_config
     return body
 
 

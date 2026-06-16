@@ -726,6 +726,25 @@ td span {
   gap: 0.85rem;
 }
 
+.run-estimate {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.run-estimate button {
+  width: max-content;
+  padding: 0 0.75rem;
+  background: #fff;
+}
+
+.estimate-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .chart-wrap {
   height: 15rem;
 }
