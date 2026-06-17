@@ -318,8 +318,7 @@ export default function App() {
       refreshRuns(),
       api.experimentDefaults().then((config) => setExperimentConfig(applyLlmSettings(config, loadSavedLlmSettings()))),
       api.configStatus().then(setConfigStatus),
-      api.sourceDatasets().then(setSourceDatasets),
-      api.databaseSize().then(setDatabaseSize)
+      api.sourceDatasets().then(setSourceDatasets)
     ]).catch((exc) =>
       setError(String(exc.message ?? exc))
     );

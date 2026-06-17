@@ -5,7 +5,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .retrieval import MAX_RETURNED_CANDIDATES
+from .retrieval import MAX_RETURNED_CANDIDATES, alpaca_query_fingerprint
 
 
 @dataclass
@@ -130,6 +130,24 @@ def _limited_candidates(row: dict[str, Any]) -> list[dict[str, Any]]:
     return limited
 
 
+def _alpaca_request_payload(row: dict[str, Any]) -> dict[str, Any] | None:
+    backend_requests = row.get("backend_requests")
+    if not isinstance(backend_requests, list) or not backend_requests:
+        return None
+    first_request = backend_requests[0]
+    if not isinstance(first_request, dict):
+        return None
+    request_payload = first_request.get("request")
+    return request_payload if isinstance(request_payload, dict) else None
+
+
+def _retrieval_fingerprint(row: dict[str, Any]) -> str | None:
+    request_payload = _alpaca_request_payload(row)
+    if not request_payload:
+        return None
+    return alpaca_query_fingerprint(request_payload)
+
+
 def create_import_run(
     conn: psycopg.Connection[Any],
     *,
@@ -209,6 +227,8 @@ def import_experiment_row(
     row: dict[str, Any],
 ) -> RowImportStats:
     qids = _clean_qids(row.get("gold_qids") or row.get("gt_qids") or [])
+    candidates = _limited_candidates(row)
+    retrieval_fingerprint = _retrieval_fingerprint(row)
     mention = conn.execute(
         """
         INSERT INTO mentions (
@@ -216,11 +236,12 @@ def import_experiment_row(
             mention, mention_text, lookup_text, primary_gt_qid, selected_qid,
             selected_label, final_correct, coverage_correct, hit_at_1, hit_at_5,
             hit_at_10, hit_at_k, best_gt_rank, retrieved_count, candidate_count,
-            candidate_backend, query_engine, raw_payload
+            candidate_backend, query_engine, raw_payload, retrieval_fingerprint,
+            retrieval_cache_candidate_count
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (run_id, cell_key) DO NOTHING
         RETURNING id
@@ -251,6 +272,8 @@ def import_experiment_row(
             _as_text(row.get("candidate_backend")),
             _as_text(row.get("query_engine")),
             Jsonb(_mention_metadata(row)),
+            retrieval_fingerprint,
+            len(candidates),
         ),
     ).fetchone()
     if not mention:
@@ -279,7 +302,6 @@ def import_experiment_row(
             gold_rows,
         )
 
-    candidates = _limited_candidates(row)
     candidate_count = 0
     if candidates:
         candidate_rows = []

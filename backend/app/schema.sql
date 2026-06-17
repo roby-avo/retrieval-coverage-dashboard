@@ -97,6 +97,12 @@ CREATE INDEX IF NOT EXISTS idx_mentions_dataset ON mentions (dataset_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_table ON mentions (table_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_lookup_text ON mentions USING gin (to_tsvector('simple', coalesce(mention, '') || ' ' || coalesce(lookup_text, '')));
 
+ALTER TABLE mentions
+    ADD COLUMN IF NOT EXISTS retrieval_fingerprint TEXT,
+    ADD COLUMN IF NOT EXISTS retrieval_cache_candidate_count INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_mentions_retrieval_fingerprint ON mentions (retrieval_fingerprint, retrieval_cache_candidate_count DESC) WHERE retrieval_fingerprint IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS gold_qids (
     id BIGSERIAL PRIMARY KEY,
     mention_id BIGINT NOT NULL REFERENCES mentions(id) ON DELETE CASCADE,
@@ -133,9 +139,12 @@ CREATE TABLE IF NOT EXISTS candidates (
 );
 
 CREATE INDEX IF NOT EXISTS idx_candidates_mention_rank ON candidates (mention_id, rank);
+CREATE INDEX IF NOT EXISTS idx_candidates_mention_qid_rank ON candidates (mention_id, qid, rank) WHERE qid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_candidates_qid ON candidates (qid);
 CREATE INDEX IF NOT EXISTS idx_candidates_stage ON candidates (retrieval_stage);
 CREATE INDEX IF NOT EXISTS idx_candidates_gold_match ON candidates (gold_match);
+CREATE INDEX IF NOT EXISTS idx_mentions_run_dataset ON mentions (run_id, dataset_id, id);
+CREATE INDEX IF NOT EXISTS idx_mentions_run_best_rank ON mentions (run_id, best_gt_rank);
 
 CREATE TABLE IF NOT EXISTS feedback_notes (
     id BIGSERIAL PRIMARY KEY,
@@ -186,3 +195,24 @@ ALTER TABLE experiment_jobs
 
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_status ON experiment_jobs (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_experiment_jobs_created ON experiment_jobs (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS alpaca_search_cache (
+    fingerprint TEXT PRIMARY KEY,
+    query_payload JSONB NOT NULL,
+    response_payload JSONB NOT NULL,
+    cached_candidate_count INTEGER NOT NULL,
+    hit_count BIGINT NOT NULL DEFAULT 0,
+    first_cached_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_cached_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_hit_at TIMESTAMPTZ
+);
+
+ALTER TABLE alpaca_search_cache
+    ADD COLUMN IF NOT EXISTS cached_candidate_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS hit_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS first_cached_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS last_cached_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS last_hit_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_alpaca_search_cache_last_cached ON alpaca_search_cache (last_cached_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alpaca_search_cache_candidate_count ON alpaca_search_cache (cached_candidate_count DESC);

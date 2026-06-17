@@ -924,11 +924,11 @@ def coverage_curve(run_id: int, buckets: str | None = Query(default=None)) -> li
                 """
                 SELECT coalesce(max(coalesce(m.best_gt_rank, m.retrieved_count, c.max_candidate_rank)), 1) AS max_rank
                 FROM mentions m
-                LEFT JOIN (
-                    SELECT mention_id, max(rank) AS max_candidate_rank
-                    FROM candidates
-                    GROUP BY mention_id
-                ) c ON c.mention_id = m.id
+                LEFT JOIN LATERAL (
+                    SELECT max(rank) AS max_candidate_rank
+                    FROM candidates c
+                    WHERE c.mention_id = m.id
+                ) c ON true
                 WHERE m.run_id = %s
                 """,
                 (run_id,),
@@ -942,24 +942,35 @@ def coverage_curve(run_id: int, buckets: str | None = Query(default=None)) -> li
                 FROM mentions
                 WHERE run_id = %s
             ),
+            gold_hits AS (
+                SELECT c.mention_id, min(c.rank) AS gold_best_rank
+                FROM candidates c
+                JOIN selected_mentions m ON m.id = c.mention_id
+                JOIN gold_qids g ON g.mention_id = c.mention_id AND g.qid = c.qid
+                GROUP BY c.mention_id
+            ),
+            scored_mentions AS (
+                SELECT
+                    m.id,
+                    nullif(
+                        least(
+                            coalesce(m.best_gt_rank, 2147483647),
+                            coalesce(gold_hits.gold_best_rank, 2147483647)
+                        ),
+                        2147483647
+                    ) AS imported_best_rank
+                FROM selected_mentions m
+                LEFT JOIN gold_hits ON gold_hits.mention_id = m.id
+            ),
             ks AS (
                 SELECT unnest(%s::int[]) AS k
             )
             SELECT
                 ks.k,
-                count(selected_mentions.id) AS total,
-                count(selected_mentions.id) FILTER (
-                    WHERE selected_mentions.best_gt_rank <= ks.k
-                       OR EXISTS (
-                        SELECT 1
-                        FROM candidates c
-                        JOIN gold_qids g ON g.mention_id = selected_mentions.id AND g.qid = c.qid
-                        WHERE c.mention_id = selected_mentions.id
-                          AND c.rank <= ks.k
-                    )
-                ) AS covered
+                count(scored_mentions.id) AS total,
+                count(scored_mentions.id) FILTER (WHERE scored_mentions.imported_best_rank <= ks.k) AS covered
             FROM ks
-            CROSS JOIN selected_mentions
+            CROSS JOIN scored_mentions
             GROUP BY ks.k
             ORDER BY ks.k
             """,
@@ -990,68 +1001,73 @@ def run_mentions(
     dataset_id: str | None = None,
     search: str | None = None,
 ) -> dict[str, Any]:
-    conditions = ["m.run_id = %s"]
-    params: list[Any] = [run_id]
-    covered_expr = """
-        (
-        coalesce(m.coverage_correct, false)
-        OR m.best_gt_rank IS NOT NULL
-        OR EXISTS (
-            SELECT 1
-            FROM candidates c
-            JOIN gold_qids g ON g.mention_id = m.id AND g.qid = c.qid
-            WHERE c.mention_id = m.id
-        )
-        )
-    """
-    best_rank_expr = """
-        nullif(
-            least(
-                coalesce(m.best_gt_rank, 2147483647),
-                coalesce((
-                    SELECT min(c.rank)
-                    FROM candidates c
-                    JOIN gold_qids g ON g.mention_id = m.id AND g.qid = c.qid
-                    WHERE c.mention_id = m.id
-                ), 2147483647)
-            ),
-            2147483647
-        )
-    """
-
-    if covered == "covered":
-        conditions.append(covered_expr)
-    elif covered == "missed":
-        conditions.append(f"NOT {covered_expr}")
+    base_conditions = ["m.run_id = %s"]
+    base_params: list[Any] = [run_id]
     if dataset_id:
-        conditions.append("m.dataset_id = %s")
-        params.append(dataset_id)
+        base_conditions.append("m.dataset_id = %s")
+        base_params.append(dataset_id)
     if search:
-        conditions.append("(m.mention ILIKE %s OR m.lookup_text ILIKE %s OR m.cell_key ILIKE %s)")
+        base_conditions.append("(m.mention ILIKE %s OR m.lookup_text ILIKE %s OR m.cell_key ILIKE %s)")
         like = f"%{search}%"
-        params.extend([like, like, like])
+        base_params.extend([like, like, like])
 
-    where = " AND ".join(conditions)
-    with connect() as conn:
-        total = conn.execute(f"SELECT count(*) AS total FROM mentions m WHERE {where}", params).fetchone()
-        rows = conn.execute(
-            f"""
+    base_where = " AND ".join(base_conditions)
+    scored_cte = f"""
+        WITH gold_hits AS (
+            SELECT c.mention_id, min(c.rank) AS gold_best_rank
+            FROM candidates c
+            JOIN gold_qids g ON g.mention_id = c.mention_id AND g.qid = c.qid
+            JOIN mentions m ON m.id = c.mention_id
+            WHERE {base_where}
+            GROUP BY c.mention_id
+        ),
+        scored_mentions AS (
             SELECT
                 m.id, m.cell_key, m.dataset_id, m.table_id, m.row_id, m.col_id,
                 m.mention, m.lookup_text, m.primary_gt_qid, m.selected_qid, m.selected_label,
                 m.final_correct, m.coverage_correct, m.hit_at_1, m.hit_at_5, m.hit_at_10,
                 m.hit_at_k, m.best_gt_rank, m.retrieved_count, m.candidate_count,
-                ({covered_expr}) AS covered_by_imported_candidates,
-                ({best_rank_expr}) AS imported_best_rank
+                (
+                    coalesce(m.coverage_correct, false)
+                    OR m.best_gt_rank IS NOT NULL
+                    OR gold_hits.gold_best_rank IS NOT NULL
+                ) AS covered_by_imported_candidates,
+                nullif(
+                    least(
+                        coalesce(m.best_gt_rank, 2147483647),
+                        coalesce(gold_hits.gold_best_rank, 2147483647)
+                    ),
+                    2147483647
+                ) AS imported_best_rank
             FROM mentions m
-            WHERE {where}
+            LEFT JOIN gold_hits ON gold_hits.mention_id = m.id
+            WHERE {base_where}
+        )
+    """
+    score_where = "TRUE"
+    if covered == "covered":
+        score_where = "covered_by_imported_candidates"
+    elif covered == "missed":
+        score_where = "NOT covered_by_imported_candidates"
+    scored_params = [*base_params, *base_params]
+    with connect() as conn:
+        total = conn.execute(
+            f"{scored_cte} SELECT count(*) AS total FROM scored_mentions WHERE {score_where}",
+            scored_params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""
+            {scored_cte}
+            SELECT *
+            FROM scored_mentions
+            WHERE {score_where}
             ORDER BY
-                CASE WHEN ({covered_expr}) THEN 1 ELSE 0 END ASC,
+                CASE WHEN covered_by_imported_candidates THEN 1 ELSE 0 END ASC,
                 imported_best_rank NULLS LAST,
-                m.id ASC
+                id ASC
             LIMIT %s OFFSET %s
             """,
-            [*params, limit, offset],
+            [*scored_params, limit, offset],
         ).fetchall()
     return {"total": int(total["total"] if total else 0), "rows": list(rows)}
 
@@ -1061,36 +1077,34 @@ def mention_detail(mention_id: int) -> dict[str, Any]:
     with connect() as conn:
         mention = conn.execute(
             """
+            WITH gold_hits AS (
+                SELECT c.mention_id, min(c.rank) AS gold_best_rank
+                FROM candidates c
+                JOIN gold_qids g ON g.mention_id = c.mention_id AND g.qid = c.qid
+                WHERE c.mention_id = %s
+                GROUP BY c.mention_id
+            )
             SELECT
                 m.*,
                 r.name AS run_name,
                 (
                     coalesce(m.coverage_correct, false)
                     OR m.best_gt_rank IS NOT NULL
-                    OR EXISTS (
-                    SELECT 1
-                    FROM candidates c
-                    JOIN gold_qids g ON g.mention_id = m.id AND g.qid = c.qid
-                    WHERE c.mention_id = m.id
-                    )
+                    OR gold_hits.gold_best_rank IS NOT NULL
                 ) AS covered_by_imported_candidates,
                 nullif(
                     least(
                         coalesce(m.best_gt_rank, 2147483647),
-                        coalesce((
-                            SELECT min(c.rank)
-                            FROM candidates c
-                            JOIN gold_qids g ON g.mention_id = m.id AND g.qid = c.qid
-                            WHERE c.mention_id = m.id
-                        ), 2147483647)
+                        coalesce(gold_hits.gold_best_rank, 2147483647)
                     ),
                     2147483647
                 ) AS imported_best_rank
             FROM mentions m
             JOIN runs r ON r.id = m.run_id
+            LEFT JOIN gold_hits ON gold_hits.mention_id = m.id
             WHERE m.id = %s
             """,
-            (mention_id,),
+            (mention_id, mention_id),
         ).fetchone()
         _row_or_404(mention, "Mention")
         gold = conn.execute(
