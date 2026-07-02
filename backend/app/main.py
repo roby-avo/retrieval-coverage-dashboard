@@ -28,7 +28,7 @@ from .experiment_runner import (
     default_experiment_config,
     normalize_experiment_config,
 )
-from .llm_estimation import estimate_experiment_llm_usage, estimate_llm_usage
+from .llm_estimation import estimate_experiment_llm_usage, estimate_llm_usage, llm_usage_cost_from_metadata
 from .source_loader import requested_source_datasets, seed_source_data
 from .retrieval import (
     ALPACA_METADATA_URL,
@@ -180,6 +180,33 @@ def _llm_batch_explanation(item: dict[str, Any]) -> str:
             f"{unknown} used unknown IDs, and {missing} requested tasks did not become usable query plans."
         )
     return f"No usable LLM task objects were stored for this batch; {missing}/{requested} requested tasks need attention."
+
+
+def _task_troubleshooting_flags(plan: dict[str, Any], mention: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    plan_source = str(plan.get("query_plan_source") or "heuristic")
+    retrieval_error = str(mention.get("retrieval_error") or "").strip()
+    candidate_count: int | None = None
+    if mention.get("candidate_count") is not None:
+        candidate_count = int(mention.get("candidate_count") or 0)
+    if plan_source == "heuristic":
+        flags.append("heuristic_plan")
+    if plan.get("query_plan_error"):
+        flags.append("llm_plan_error")
+    if retrieval_error:
+        flags.append("alpaca_error")
+    if candidate_count == 0:
+        flags.append("zero_candidates")
+    if plan_source == "heuristic" and (retrieval_error or candidate_count == 0):
+        flags.append("heuristic_retrieval_problem")
+    return flags
+
+
+def _numeric(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None and value != "" else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_buckets(raw: str) -> list[int]:
@@ -579,6 +606,14 @@ def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any]
         "endpoint": endpoint,
         "request_body": body,
         "response_usage": payload.get("usage"),
+        "usage_cost": llm_usage_cost_from_metadata(
+            provider=str(config.get("llm_provider") or ""),
+            model=str(payload.get("model") or config.get("llm_model") or ""),
+            usage=payload.get("usage"),
+            config=config,
+            input_text=json.dumps(body.get("messages") or [], ensure_ascii=False),
+            output_text=str(content or ""),
+        ),
         "response_model": payload.get("model"),
         "response_provider": payload.get("provider"),
         "response_id": payload.get("id"),
@@ -628,6 +663,14 @@ def _llm_plain_request(messages: list[dict[str, str]], llm_config: dict[str, Any
         "endpoint": endpoint,
         "request_body": body,
         "response_usage": payload.get("usage"),
+        "usage_cost": llm_usage_cost_from_metadata(
+            provider=str(config.get("llm_provider") or ""),
+            model=str(payload.get("model") or config.get("llm_model") or ""),
+            usage=payload.get("usage"),
+            config=config,
+            input_text=json.dumps(body.get("messages") or [], ensure_ascii=False),
+            output_text=str(content or ""),
+        ),
         "response_model": payload.get("model"),
         "response_provider": payload.get("provider"),
         "response_id": payload.get("id"),
@@ -1065,6 +1108,7 @@ def llm_test(request: LlmTestRequest) -> dict[str, Any]:
         "response_model": llm_request.get("response_model"),
         "response_provider": llm_request.get("response_provider"),
         "response_usage": llm_request.get("response_usage"),
+        "usage_cost": llm_request.get("usage_cost"),
         "response_id": llm_request.get("response_id"),
         "content": content,
     }
@@ -1100,7 +1144,7 @@ def experiment_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[s
                 GROUP BY batch_id
             ),
             batch_stats AS (
-                SELECT b.id, b.job_id, b.run_id, b.status, b.error, b.task_count,
+                SELECT b.id, b.job_id, b.run_id, b.provider, b.model, b.status, b.error, b.task_count, b.response_metadata,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
@@ -1118,7 +1162,13 @@ def experiment_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[s
                        coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
                        coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
                        coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
-                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision), 0) AS query_plan_prompt_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision), 0) AS query_plan_completion_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'total_tokens', response_metadata->'usage_cost'->>'total_tokens'), '')::double precision), 0) AS query_plan_total_tokens,
+                       coalesce(sum(coalesce(nullif(coalesce(response_metadata->'usage'->'cost_details'->>'upstream_inference_cost', nullif(response_metadata->'usage_cost'->>'total_cost_usd', '0'), response_metadata->'usage'->>'total_cost_usd', response_metadata->'usage'->>'cost_usd', nullif(response_metadata->'usage'->>'cost', '0')), '')::double precision, CASE WHEN lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7') THEN (coalesce(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 0.99 WHEN 'zai-glm-4.7' THEN 2.25 ELSE 0.35 END / 1000000.0) + (coalesce(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 1.49 WHEN 'zai-glm-4.7' THEN 2.75 ELSE 0.75 END / 1000000.0) END)), 0) AS query_plan_total_cost_usd,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL OR (lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7'))) AS query_plan_priced_batch_count,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'cost_kind' = 'response_reported' OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL) AS query_plan_response_reported_cost_count
                 FROM batch_stats
                 GROUP BY job_id
             )
@@ -1130,7 +1180,13 @@ def experiment_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[s
                    coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
                    coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
                    coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
-                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count,
+                   coalesce(llm.query_plan_prompt_tokens, 0) AS llm_query_plan_prompt_tokens,
+                   coalesce(llm.query_plan_completion_tokens, 0) AS llm_query_plan_completion_tokens,
+                   coalesce(llm.query_plan_total_tokens, 0) AS llm_query_plan_total_tokens,
+                   coalesce(llm.query_plan_total_cost_usd, 0) AS llm_query_plan_total_cost_usd,
+                   coalesce(llm.query_plan_priced_batch_count, 0) AS llm_query_plan_priced_batch_count,
+                   coalesce(llm.query_plan_response_reported_cost_count, 0) AS llm_query_plan_response_reported_cost_count
             FROM experiment_jobs j
             LEFT JOIN runs r ON r.id = j.imported_run_id
             LEFT JOIN llm ON llm.job_id = j.id
@@ -1192,7 +1248,7 @@ def experiment_job(job_id: int) -> dict[str, Any]:
                 GROUP BY batch_id
             ),
             batch_stats AS (
-                SELECT b.id, b.job_id, b.status, b.error, b.task_count,
+                SELECT b.id, b.job_id, b.provider, b.model, b.status, b.error, b.task_count, b.response_metadata,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
@@ -1210,7 +1266,13 @@ def experiment_job(job_id: int) -> dict[str, Any]:
                        coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
                        coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
                        coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
-                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision), 0) AS query_plan_prompt_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision), 0) AS query_plan_completion_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'total_tokens', response_metadata->'usage_cost'->>'total_tokens'), '')::double precision), 0) AS query_plan_total_tokens,
+                       coalesce(sum(coalesce(nullif(coalesce(response_metadata->'usage'->'cost_details'->>'upstream_inference_cost', nullif(response_metadata->'usage_cost'->>'total_cost_usd', '0'), response_metadata->'usage'->>'total_cost_usd', response_metadata->'usage'->>'cost_usd', nullif(response_metadata->'usage'->>'cost', '0')), '')::double precision, CASE WHEN lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7') THEN (coalesce(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 0.99 WHEN 'zai-glm-4.7' THEN 2.25 ELSE 0.35 END / 1000000.0) + (coalesce(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 1.49 WHEN 'zai-glm-4.7' THEN 2.75 ELSE 0.75 END / 1000000.0) END)), 0) AS query_plan_total_cost_usd,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL OR (lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7'))) AS query_plan_priced_batch_count,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'cost_kind' = 'response_reported' OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL) AS query_plan_response_reported_cost_count
                 FROM batch_stats
                 GROUP BY job_id
             )
@@ -1222,7 +1284,13 @@ def experiment_job(job_id: int) -> dict[str, Any]:
                    coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
                    coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
                    coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
-                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count,
+                   coalesce(llm.query_plan_prompt_tokens, 0) AS llm_query_plan_prompt_tokens,
+                   coalesce(llm.query_plan_completion_tokens, 0) AS llm_query_plan_completion_tokens,
+                   coalesce(llm.query_plan_total_tokens, 0) AS llm_query_plan_total_tokens,
+                   coalesce(llm.query_plan_total_cost_usd, 0) AS llm_query_plan_total_cost_usd,
+                   coalesce(llm.query_plan_priced_batch_count, 0) AS llm_query_plan_priced_batch_count,
+                   coalesce(llm.query_plan_response_reported_cost_count, 0) AS llm_query_plan_response_reported_cost_count
             FROM experiment_jobs j
             LEFT JOIN runs r ON r.id = j.imported_run_id
             LEFT JOIN llm ON llm.job_id = j.id
@@ -1254,7 +1322,7 @@ def runs() -> list[dict[str, Any]]:
                 GROUP BY batch_id
             ),
             batch_stats AS (
-                SELECT b.id, b.run_id, b.status, b.error, b.task_count,
+                SELECT b.id, b.run_id, b.provider, b.model, b.status, b.error, b.task_count, b.response_metadata,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
@@ -1273,7 +1341,13 @@ def runs() -> list[dict[str, Any]]:
                        coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
                        coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
                        coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
-                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision), 0) AS query_plan_prompt_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision), 0) AS query_plan_completion_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'total_tokens', response_metadata->'usage_cost'->>'total_tokens'), '')::double precision), 0) AS query_plan_total_tokens,
+                       coalesce(sum(coalesce(nullif(coalesce(response_metadata->'usage'->'cost_details'->>'upstream_inference_cost', nullif(response_metadata->'usage_cost'->>'total_cost_usd', '0'), response_metadata->'usage'->>'total_cost_usd', response_metadata->'usage'->>'cost_usd', nullif(response_metadata->'usage'->>'cost', '0')), '')::double precision, CASE WHEN lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7') THEN (coalesce(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 0.99 WHEN 'zai-glm-4.7' THEN 2.25 ELSE 0.35 END / 1000000.0) + (coalesce(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 1.49 WHEN 'zai-glm-4.7' THEN 2.75 ELSE 0.75 END / 1000000.0) END)), 0) AS query_plan_total_cost_usd,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL OR (lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7'))) AS query_plan_priced_batch_count,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'cost_kind' = 'response_reported' OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL) AS query_plan_response_reported_cost_count
                 FROM batch_stats
                 GROUP BY run_id
             )
@@ -1287,7 +1361,13 @@ def runs() -> list[dict[str, Any]]:
                    coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
                    coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
                    coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
-                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count,
+                   coalesce(llm.query_plan_prompt_tokens, 0) AS llm_query_plan_prompt_tokens,
+                   coalesce(llm.query_plan_completion_tokens, 0) AS llm_query_plan_completion_tokens,
+                   coalesce(llm.query_plan_total_tokens, 0) AS llm_query_plan_total_tokens,
+                   coalesce(llm.query_plan_total_cost_usd, 0) AS llm_query_plan_total_cost_usd,
+                   coalesce(llm.query_plan_priced_batch_count, 0) AS llm_query_plan_priced_batch_count,
+                   coalesce(llm.query_plan_response_reported_cost_count, 0) AS llm_query_plan_response_reported_cost_count
             FROM runs r
             LEFT JOIN llm ON llm.run_id = r.id
             ORDER BY r.imported_at DESC
@@ -1309,7 +1389,7 @@ def run_detail(run_id: int) -> dict[str, Any]:
                 GROUP BY batch_id
             ),
             batch_stats AS (
-                SELECT b.id, b.run_id, b.status, b.error, b.task_count,
+                SELECT b.id, b.run_id, b.provider, b.model, b.status, b.error, b.task_count, b.response_metadata,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
@@ -1328,7 +1408,13 @@ def run_detail(run_id: int) -> dict[str, Any]:
                        coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
                        coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
                        coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
-                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision), 0) AS query_plan_prompt_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision), 0) AS query_plan_completion_tokens,
+                       coalesce(sum(nullif(coalesce(response_metadata->'usage'->>'total_tokens', response_metadata->'usage_cost'->>'total_tokens'), '')::double precision), 0) AS query_plan_total_tokens,
+                       coalesce(sum(coalesce(nullif(coalesce(response_metadata->'usage'->'cost_details'->>'upstream_inference_cost', nullif(response_metadata->'usage_cost'->>'total_cost_usd', '0'), response_metadata->'usage'->>'total_cost_usd', response_metadata->'usage'->>'cost_usd', nullif(response_metadata->'usage'->>'cost', '0')), '')::double precision, CASE WHEN lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7') THEN (coalesce(nullif(coalesce(response_metadata->'usage'->>'prompt_tokens', response_metadata->'usage'->>'input_tokens', response_metadata->'usage_cost'->>'input_tokens', response_metadata->'usage_cost'->>'prompt_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 0.99 WHEN 'zai-glm-4.7' THEN 2.25 ELSE 0.35 END / 1000000.0) + (coalesce(nullif(coalesce(response_metadata->'usage'->>'completion_tokens', response_metadata->'usage'->>'output_tokens', response_metadata->'usage_cost'->>'output_tokens', response_metadata->'usage_cost'->>'completion_tokens'), '')::double precision, 0) * CASE lower(coalesce(model, '')) WHEN 'gemma-4-31b' THEN 1.49 WHEN 'zai-glm-4.7' THEN 2.75 ELSE 0.75 END / 1000000.0) END)), 0) AS query_plan_total_cost_usd,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL OR (lower(coalesce(provider, '')) = 'cerebras' AND lower(coalesce(model, '')) IN ('gpt-oss-120b', 'openai/gpt-oss-120b', 'gemma-4-31b', 'zai-glm-4.7'))) AS query_plan_priced_batch_count,
+                       count(*) FILTER (WHERE response_metadata->'usage'->'cost_details'->>'upstream_inference_cost' IS NOT NULL OR response_metadata->'usage_cost'->>'cost_kind' = 'response_reported' OR response_metadata->'usage'->>'total_cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost_usd' IS NOT NULL OR response_metadata->'usage'->>'cost' IS NOT NULL) AS query_plan_response_reported_cost_count
                 FROM batch_stats
                 GROUP BY run_id
             )
@@ -1343,6 +1429,12 @@ def run_detail(run_id: int) -> dict[str, Any]:
                    coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
                    coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
                    coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count,
+                   coalesce(llm.query_plan_prompt_tokens, 0) AS llm_query_plan_prompt_tokens,
+                   coalesce(llm.query_plan_completion_tokens, 0) AS llm_query_plan_completion_tokens,
+                   coalesce(llm.query_plan_total_tokens, 0) AS llm_query_plan_total_tokens,
+                   coalesce(llm.query_plan_total_cost_usd, 0) AS llm_query_plan_total_cost_usd,
+                   coalesce(llm.query_plan_priced_batch_count, 0) AS llm_query_plan_priced_batch_count,
+                   coalesce(llm.query_plan_response_reported_cost_count, 0) AS llm_query_plan_response_reported_cost_count,
                    r.raw_summary, r.raw_sampling_config
             FROM runs r
             LEFT JOIN llm ON llm.run_id = r.id
@@ -1379,13 +1471,22 @@ def llm_query_plan_batches(
         rows = conn.execute(
             f"""
             WITH task_stats AS (
-                SELECT batch_id,
-                       jsonb_agg(task_id ORDER BY id) AS requested_task_ids,
-                       jsonb_agg(task_id ORDER BY task_id) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS inferred_missing_task_ids,
-                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
-                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count
-                FROM llm_prompt_tasks
-                GROUP BY batch_id
+                SELECT t.batch_id,
+                       jsonb_agg(t.task_id ORDER BY t.id) AS requested_task_ids,
+                       jsonb_agg(t.task_id ORDER BY t.task_id) FILTER (WHERE coalesce(t.plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS inferred_missing_task_ids,
+                       count(*) FILTER (WHERE coalesce(t.plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
+                       count(*) FILTER (WHERE coalesce(t.plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count,
+                       count(*) FILTER (WHERE coalesce(t.plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS heuristic_plan_count,
+                       count(*) FILTER (WHERE m.id IS NOT NULL AND coalesce(m.candidate_count, 0) = 0) AS zero_candidate_count,
+                       count(*) FILTER (WHERE coalesce(m.raw_payload->>'retrieval_error', '') <> '') AS retrieval_error_count,
+                       count(*) FILTER (
+                           WHERE coalesce(t.plan_payload->>'query_plan_source', 'heuristic') = 'heuristic'
+                             AND m.id IS NOT NULL
+                             AND (coalesce(m.candidate_count, 0) = 0 OR coalesce(m.raw_payload->>'retrieval_error', '') <> '')
+                       ) AS heuristic_retrieval_problem_count
+                FROM llm_prompt_tasks t
+                LEFT JOIN mentions m ON m.id = t.mention_id
+                GROUP BY t.batch_id
             ),
             batch_stats AS (
                 SELECT b.id, b.run_id, b.job_id, b.provider, b.endpoint, b.model, b.prompt_template,
@@ -1398,9 +1499,14 @@ def llm_query_plan_batches(
                        coalesce(b.response_metadata->'task_trace'->'requested_task_ids', t.requested_task_ids, '[]'::jsonb) AS requested_task_ids,
                        coalesce(b.response_metadata->'task_trace'->'unknown_task_ids', '[]'::jsonb) AS unknown_returned_task_ids,
                        coalesce(nullif(b.response_metadata->'task_trace'->>'invalid_task_count', '')::int, 0) AS invalid_task_count,
+                       coalesce(t.heuristic_plan_count, 0) AS heuristic_plan_count,
+                       coalesce(t.zero_candidate_count, 0) AS zero_candidate_count,
+                       coalesce(t.retrieval_error_count, 0) AS retrieval_error_count,
+                       coalesce(t.heuristic_retrieval_problem_count, 0) AS heuristic_retrieval_problem_count,
                        b.response_metadata->>'parse_warning' AS parse_warning,
                        b.response_metadata->'attempts' AS attempts,
-                       b.response_metadata->'usage' AS usage
+                       b.response_metadata->'usage' AS usage,
+                       b.response_metadata->'usage_cost' AS usage_cost
                 FROM llm_prompt_batches b
                 LEFT JOIN task_stats t ON t.batch_id = b.id
                 WHERE {' AND '.join(filters)}
@@ -1418,10 +1524,14 @@ def llm_query_plan_batches(
         if include_details and batch_ids:
             task_rows = conn.execute(
                 """
-                SELECT batch_id, task_id, mention_text, lookup_text, plan_payload
-                FROM llm_prompt_tasks
-                WHERE batch_id = ANY(%s)
-                ORDER BY batch_id, id
+                SELECT t.batch_id, t.task_id, t.mention_text, t.lookup_text, t.plan_payload,
+                       m.id AS mention_id, m.candidate_count, m.retrieved_count, m.best_gt_rank,
+                       m.raw_payload->>'retrieval_error' AS retrieval_error,
+                       m.raw_payload->'backend_requests' AS backend_requests
+                FROM llm_prompt_tasks t
+                LEFT JOIN mentions m ON m.id = t.mention_id
+                WHERE t.batch_id = ANY(%s)
+                ORDER BY t.batch_id, t.id
                 """,
                 (batch_ids,),
             ).fetchall()
@@ -1453,6 +1563,24 @@ def llm_query_plan_batches(
             item["matched_returned_task_count"] = 0
             item["unknown_returned_task_count"] = len(item.get("unknown_returned_task_ids") or [])
         item["response_parse_error"] = response_parse_error
+        usage_cost = item.get("usage_cost") if isinstance(item.get("usage_cost"), dict) else None
+        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+        upstream_cost = _numeric(((usage.get("cost_details") or {}) if isinstance(usage.get("cost_details"), dict) else {}).get("upstream_inference_cost"))
+        stored_cost = _numeric((usage_cost or {}).get("total_cost_usd"))
+        if usage_cost is None or (upstream_cost is not None and upstream_cost > 0 and (stored_cost is None or stored_cost <= 0)):
+            usage_cost = llm_usage_cost_from_metadata(
+                provider=item.get("provider"),
+                model=item.get("model"),
+                usage=usage,
+                config={},
+            )
+        item["usage_cost"] = usage_cost
+        item["heuristic_analysis"] = {
+            "heuristic_plan_count": int(item.get("heuristic_plan_count") or 0),
+            "zero_candidate_count": int(item.get("zero_candidate_count") or 0),
+            "retrieval_error_count": int(item.get("retrieval_error_count") or 0),
+            "heuristic_retrieval_problem_count": int(item.get("heuristic_retrieval_problem_count") or 0),
+        }
 
         if include_details:
             task_details = []
@@ -1465,6 +1593,15 @@ def llm_query_plan_batches(
                 plan_source = str(plan.get("query_plan_source") or "heuristic")
                 returned_task = returned_by_id.get(task_id)
                 usable = plan_source != "heuristic" and not plan.get("error")
+                retrieval_error = str(task.get("retrieval_error") or "").strip() or None
+                candidate_count = int(task.get("candidate_count") or 0) if task.get("mention_id") is not None else None
+                troubleshooting_flags = _task_troubleshooting_flags(
+                    plan,
+                    {
+                        "retrieval_error": retrieval_error,
+                        "candidate_count": candidate_count,
+                    },
+                )
                 if usable:
                     usable_count += 1
                 else:
@@ -1478,6 +1615,7 @@ def llm_query_plan_batches(
                 task_details.append(
                     {
                         "task_id": task_id,
+                        "mention_id": task.get("mention_id"),
                         "mention_text": task.get("mention_text"),
                         "lookup_text": task.get("lookup_text"),
                         "state": state,
@@ -1490,6 +1628,11 @@ def llm_query_plan_batches(
                         "fine_type": plan.get("fine_type") or (returned_task or {}).get("fine_type"),
                         "wikipedia_url": plan.get("wikipedia_url") or (returned_task or {}).get("wikipedia_url"),
                         "dbpedia_url": plan.get("dbpedia_url") or (returned_task or {}).get("dbpedia_url"),
+                        "candidate_count": candidate_count,
+                        "retrieved_count": task.get("retrieved_count"),
+                        "best_gt_rank": task.get("best_gt_rank"),
+                        "retrieval_error": retrieval_error,
+                        "troubleshooting_flags": troubleshooting_flags,
                     }
                 )
             if task_details:
@@ -1508,6 +1651,118 @@ def llm_query_plan_batches(
         item["explanation"] = _llm_batch_explanation(item)
         items.append(item)
     return items
+
+
+@app.get("/api/heuristic-plan-analysis")
+def heuristic_plan_analysis(
+    run_id: int = Query(ge=1),
+    problem_only: bool = Query(default=True),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    problem_filter = ""
+    if problem_only:
+        problem_filter = """
+        AND (
+            candidate_count = 0
+            OR retrieval_error IS NOT NULL
+            OR query_plan_error IS NOT NULL
+            OR best_gt_rank IS NULL
+        )
+        """
+    with connect() as conn:
+        summary = conn.execute(
+            """
+            WITH heuristic_mentions AS (
+                SELECT
+                    m.id,
+                    m.candidate_count,
+                    m.best_gt_rank,
+                    nullif(m.raw_payload->>'retrieval_error', '') AS retrieval_error,
+                    nullif(m.raw_payload->'query_plan'->>'query_plan_error', '') AS query_plan_error
+                FROM mentions m
+                WHERE m.run_id = %s
+                  AND (
+                      coalesce(m.raw_payload->'query_plan'->>'query_plan_source', '') LIKE 'heuristic%%'
+                      OR coalesce(m.query_engine, '') LIKE 'heuristic%%'
+                      OR nullif(m.raw_payload->'query_plan'->>'query_plan_error', '') IS NOT NULL
+                  )
+            )
+            SELECT
+                count(*) AS heuristic_plan_count,
+                count(*) FILTER (WHERE query_plan_error IS NOT NULL) AS llm_fallback_error_count,
+                count(*) FILTER (WHERE candidate_count = 0) AS zero_candidate_count,
+                count(*) FILTER (WHERE retrieval_error IS NOT NULL) AS retrieval_error_count,
+                count(*) FILTER (WHERE candidate_count = 0 OR retrieval_error IS NOT NULL) AS retrieval_problem_count,
+                count(*) FILTER (WHERE best_gt_rank IS NULL) AS missed_count,
+                count(*) FILTER (WHERE best_gt_rank IS NOT NULL) AS covered_count
+            FROM heuristic_mentions
+            """,
+            (run_id,),
+        ).fetchone()
+        rows = conn.execute(
+            f"""
+            WITH heuristic_mentions AS (
+                SELECT
+                    m.id,
+                    m.cell_key,
+                    m.dataset_id,
+                    m.table_id,
+                    m.row_id,
+                    m.col_id,
+                    m.mention_text,
+                    m.lookup_text,
+                    m.primary_gt_qid,
+                    m.candidate_count,
+                    m.retrieved_count,
+                    m.best_gt_rank,
+                    m.query_engine,
+                    m.raw_payload->'query_plan' AS query_plan,
+                    coalesce(m.raw_payload->'query_plan'->>'query_plan_source', m.query_engine, 'heuristic') AS query_plan_source,
+                    nullif(m.raw_payload->'query_plan'->>'query_plan_error', '') AS query_plan_error,
+                    nullif(m.raw_payload->>'retrieval_error', '') AS retrieval_error
+                FROM mentions m
+                WHERE m.run_id = %s
+                  AND (
+                      coalesce(m.raw_payload->'query_plan'->>'query_plan_source', '') LIKE 'heuristic%%'
+                      OR coalesce(m.query_engine, '') LIKE 'heuristic%%'
+                      OR nullif(m.raw_payload->'query_plan'->>'query_plan_error', '') IS NOT NULL
+                  )
+            )
+            SELECT *
+            FROM heuristic_mentions
+            WHERE TRUE
+            {problem_filter}
+            ORDER BY
+                CASE WHEN retrieval_error IS NOT NULL THEN 0 ELSE 1 END,
+                CASE WHEN candidate_count = 0 THEN 0 ELSE 1 END,
+                CASE WHEN query_plan_error IS NOT NULL THEN 0 ELSE 1 END,
+                best_gt_rank NULLS FIRST,
+                id ASC
+            LIMIT %s
+            """,
+            (run_id, limit),
+        ).fetchall()
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        plan = item.get("query_plan") if isinstance(item.get("query_plan"), dict) else {}
+        item["optimized_query"] = plan.get("optimized_query") or item.get("lookup_text") or item.get("mention_text")
+        item["normalized_mention"] = plan.get("normalized_mention")
+        item["coarse_type"] = plan.get("coarse_type")
+        item["fine_type"] = plan.get("fine_type")
+        item["troubleshooting_flags"] = _task_troubleshooting_flags(
+            {**plan, "query_plan_source": item.get("query_plan_source"), "query_plan_error": item.get("query_plan_error")},
+            {"retrieval_error": item.get("retrieval_error"), "candidate_count": item.get("candidate_count")},
+        )
+        item.pop("query_plan", None)
+        items.append(item)
+
+    summary_item = dict(summary or {})
+    total = int(summary_item.get("heuristic_plan_count") or 0)
+    covered = int(summary_item.get("covered_count") or 0)
+    summary_item["coverage"] = covered / total if total else 0
+    return {"summary": summary_item, "rows": items}
 
 
 @app.delete("/api/runs/{run_id}")

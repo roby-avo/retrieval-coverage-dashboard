@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 from .datasets import build_random_sample_bundle_from_db
 from .db import connect
 from .importer import create_import_run, finalize_import_run, import_experiment_row, update_run_counters, upsert_experiment_table
+from .llm_estimation import llm_usage_cost_from_metadata
 from .retrieval import (
     ALPACA_METADATA_URL,
     MAX_RETURNED_CANDIDATES,
@@ -798,6 +799,14 @@ def _call_llm_batch(samples: Sequence[dict[str, Any]], config: dict[str, Any], b
             "task_trace": default_task_trace,
             "response_tasks": response_tasks or [],
             "response_usage": payload.get("usage"),
+            "usage_cost": llm_usage_cost_from_metadata(
+                provider=str(config.get("llm_provider") or ""),
+                model=str(payload.get("model") or config.get("llm_model") or ""),
+                usage=payload.get("usage"),
+                config=config,
+                input_text=json.dumps(body.get("messages") or [], ensure_ascii=False),
+                output_text=str(response_content or ""),
+            ),
             "response_model": payload.get("model"),
             "response_provider": payload.get("provider"),
             "response_id": payload.get("id"),
@@ -1271,23 +1280,35 @@ def _summarize_llm_logs(llm_logs: Sequence[dict[str, Any]]) -> dict[str, Any]:
     total_prompt = 0
     total_completion = 0
     total_tokens = 0
+    total_cost = 0.0
+    priced_call_count = 0
+    response_reported_cost_count = 0
     call_count = 0
     error_count = 0
     for log in llm_logs:
         if log.get("error") or log.get("parse_warning"):
             error_count += 1
-            continue
-        call_count += 1
         usage = log.get("response_usage") or {}
-        total_prompt += int(usage.get("prompt_tokens") or 0)
-        total_completion += int(usage.get("completion_tokens") or 0)
-        total_tokens += int(usage.get("total_tokens") or 0)
+        usage_cost = log.get("usage_cost") if isinstance(log.get("usage_cost"), dict) else {}
+        if usage or usage_cost:
+            call_count += 1
+        total_prompt += int(usage.get("prompt_tokens") or usage.get("input_tokens") or usage_cost.get("input_tokens") or usage_cost.get("prompt_tokens") or 0)
+        total_completion += int(usage.get("completion_tokens") or usage.get("output_tokens") or usage_cost.get("output_tokens") or usage_cost.get("completion_tokens") or 0)
+        total_tokens += int(usage.get("total_tokens") or usage_cost.get("total_tokens") or 0)
+        if usage_cost.get("total_cost_usd") is not None:
+            total_cost += float(usage_cost.get("total_cost_usd") or 0)
+            priced_call_count += 1
+            if usage_cost.get("cost_kind") == "response_reported":
+                response_reported_cost_count += 1
     return {
         "llm_call_count": call_count,
         "llm_error_count": error_count,
         "llm_prompt_tokens": total_prompt,
         "llm_completion_tokens": total_completion,
         "llm_total_tokens": total_tokens,
+        "llm_total_cost_usd": total_cost if priced_call_count else None,
+        "llm_priced_call_count": priced_call_count,
+        "llm_response_reported_cost_count": response_reported_cost_count,
     }
 
 
@@ -1308,6 +1329,7 @@ def _store_llm_prompt_batches(
             continue
         response_metadata = {
             "usage": log.get("response_usage"),
+            "usage_cost": log.get("usage_cost") if isinstance(log.get("usage_cost"), dict) else None,
             "model": log.get("response_model"),
             "provider": log.get("response_provider"),
             "id": log.get("response_id"),

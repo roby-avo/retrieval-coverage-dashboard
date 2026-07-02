@@ -665,17 +665,32 @@ td span {
   gap: 1rem;
 }
 
+.heuristic-plan-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 1rem;
+}
+
 .llm-plan-summary,
 .llm-plan-toolbar,
 .llm-batch-list-panel,
-.llm-batch-inspector {
+.llm-batch-inspector,
+.heuristic-plan-summary,
+.heuristic-table-panel {
   min-width: 0;
 }
 
 .llm-plan-metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(7rem, 1fr));
+  grid-template-columns: repeat(4, minmax(7rem, 1fr));
   gap: 0.75rem;
+}
+
+.llm-cost-note {
+  margin-top: 0.75rem;
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 .inline-toggle {
@@ -758,7 +773,7 @@ td span {
 }
 
 .llm-batch-card-counts {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.35rem;
 }
 
@@ -820,6 +835,10 @@ td span {
   background: var(--panel-soft);
 }
 
+.llm-diagnosis-grid.compact {
+  grid-template-columns: repeat(4, minmax(7rem, 1fr));
+}
+
 .llm-alert {
   border: 1px solid rgba(180, 35, 24, 0.28);
   border-radius: 6px;
@@ -843,30 +862,40 @@ td span {
 }
 
 .llm-task-table {
-  min-width: 56rem;
+  min-width: 68rem;
 }
 
-.llm-task-table th {
+.heuristic-task-table {
+  min-width: 78rem;
+}
+
+.llm-task-table th,
+.heuristic-task-table th {
   position: sticky;
   top: 0;
   background: #fff;
   z-index: 1;
 }
 
-.llm-task-table tr.problem {
+.llm-task-table tr.problem,
+.heuristic-task-table tr.problem {
   background: #fff7f7;
 }
 
-.llm-task-table td {
+.llm-task-table td,
+.heuristic-task-table td {
   vertical-align: top;
 }
 
 .llm-task-table td strong,
-.llm-task-table td span {
+.llm-task-table td span,
+.heuristic-task-table td strong,
+.heuristic-task-table td span {
   display: block;
 }
 
-.llm-task-table td span {
+.llm-task-table td span,
+.heuristic-task-table td span {
   color: var(--muted);
   font-size: 0.76rem;
 }

@@ -35,6 +35,7 @@ import {
   ExperimentJob,
   Filters,
   GoldMetadataResult,
+  HeuristicPlanAnalysis,
   ImprovementDiagnostics,
   LiveAttempt,
   LlmTestResult,
@@ -72,7 +73,7 @@ const LLM_SETTING_KEYS = [
   "use_heuristic_fallback_on_llm_failure",
   "openrouter_allow_fallbacks"
 ] as const;
-type WorkspaceView = "overview" | "mentions" | "llm-plans" | "monitor" | "settings";
+type WorkspaceView = "overview" | "mentions" | "llm-plans" | "heuristic-plans" | "monitor" | "settings";
 type InspectorTab = "overview" | "live" | "candidates" | "inspection" | "feedback";
 type LlmSettingKey = (typeof LLM_SETTING_KEYS)[number];
 type LlmSettings = Pick<ExperimentConfig, LlmSettingKey>;
@@ -259,7 +260,22 @@ function llmPlanStatsSummary(item: Run | ExperimentJob | null | undefined): stri
   const incomplete = item?.llm_query_plan_incomplete_batch_count ?? 0;
   const missing = item?.llm_query_plan_missing_task_count ?? 0;
   const requested = item?.llm_query_plan_requested_task_count ?? 0;
-  return `LLM plans ${compactNumber(failed)}/${compactNumber(batches)} failed · ${compactNumber(incomplete)} incomplete · ${compactNumber(missing)}/${compactNumber(requested)} missing tasks`;
+  const cost = item?.llm_query_plan_priced_batch_count ? ` · ${compactUsd(item.llm_query_plan_total_cost_usd)} LLM` : "";
+  return `LLM plans ${compactNumber(failed)}/${compactNumber(batches)} failed · ${compactNumber(incomplete)} incomplete · ${compactNumber(missing)}/${compactNumber(requested)} missing tasks${cost}`;
+}
+
+function usageCostLabel(cost: LlmQueryPlanBatch["usage_cost"] | undefined | null): string {
+  if (!cost) return "-";
+  return compactUsd(cost.total_cost_usd);
+}
+
+function costSourceLabel(cost: LlmQueryPlanBatch["usage_cost"] | undefined | null): string {
+  if (!cost?.cost_kind) return "No price";
+  if (cost.cost_kind === "response_reported") return "Response reported";
+  if (cost.cost_kind === "actual_tokens_catalog_pricing") return "Actual tokens, catalog price";
+  if (cost.cost_kind === "actual_tokens_no_price") return "Actual tokens, price unavailable";
+  if (cost.cost_kind === "actual_tokens_price_lookup_failed") return "Actual tokens, price lookup failed";
+  return cost.cost_kind.replace(/_/g, " ");
 }
 
 function matchingSourceDatasets(config: ExperimentConfig, sourceDatasets: SourceDataset[]): SourceDataset[] {
@@ -343,6 +359,8 @@ export default function App() {
   const [llmPlanBatches, setLlmPlanBatches] = useState<LlmQueryPlanBatch[]>([]);
   const [llmBatchProblemOnly, setLlmBatchProblemOnly] = useState(true);
   const [selectedLlmBatchId, setSelectedLlmBatchId] = useState<number | null>(null);
+  const [heuristicPlanAnalysis, setHeuristicPlanAnalysis] = useState<HeuristicPlanAnalysis | null>(null);
+  const [heuristicProblemOnly, setHeuristicProblemOnly] = useState(true);
   const [estimateError, setEstimateError] = useState("");
   const [settingsSaved, setSettingsSaved] = useState("");
   const [llmTestBusy, setLlmTestBusy] = useState(false);
@@ -363,11 +381,12 @@ export default function App() {
     } else {
       setSelectedRun(null);
       setLlmPlanBatches([]);
+      setHeuristicPlanAnalysis(null);
     }
   }
 
   async function refreshRunData(runId: number) {
-    const [run, coverageRows, filterRows, mentionRows, problemBatches] = await Promise.all([
+    const [run, coverageRows, filterRows, mentionRows, problemBatches, heuristicAnalysis] = await Promise.all([
       api.run(runId),
       api.coverage(runId),
       api.filters(runId),
@@ -378,7 +397,8 @@ export default function App() {
         dataset_id: datasetFilter,
         search
       }),
-      api.llmQueryPlanBatches({ run_id: runId, problem_only: llmBatchProblemOnly, limit: 100, include_details: true })
+      api.llmQueryPlanBatches({ run_id: runId, problem_only: llmBatchProblemOnly, limit: 100, include_details: true }),
+      api.heuristicPlanAnalysis({ run_id: runId, problem_only: heuristicProblemOnly, limit: 200 })
     ]);
     setSelectedRun(run);
     setCoverage(coverageRows);
@@ -386,6 +406,7 @@ export default function App() {
     setMentions(mentionRows.rows);
     setMentionTotal(mentionRows.total);
     setLlmPlanBatches(problemBatches);
+    setHeuristicPlanAnalysis(heuristicAnalysis);
     if (problemBatches.length && !problemBatches.some((batch) => batch.id === selectedLlmBatchId)) {
       setSelectedLlmBatchId(problemBatches[0].id);
     }
@@ -435,7 +456,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedRunId) return;
     refreshRunData(selectedRunId).catch((exc) => setError(String(exc.message ?? exc)));
-  }, [selectedRunId, coveredFilter, datasetFilter, offset, llmBatchProblemOnly]);
+  }, [selectedRunId, coveredFilter, datasetFilter, offset, llmBatchProblemOnly, heuristicProblemOnly]);
 
   const chartData = useMemo(
     () =>
@@ -455,6 +476,12 @@ export default function App() {
   const selectedRunLlmReturnedTasks = selectedRun?.llm_query_plan_returned_task_count ?? 0;
   const selectedRunLlmUsableTasks = selectedRun?.llm_query_plan_usable_task_count ?? 0;
   const selectedRunLlmMissingTasks = selectedRun?.llm_query_plan_missing_task_count ?? 0;
+  const selectedRunLlmInputTokens = selectedRun?.llm_query_plan_prompt_tokens ?? 0;
+  const selectedRunLlmOutputTokens = selectedRun?.llm_query_plan_completion_tokens ?? 0;
+  const selectedRunLlmTokens = selectedRun?.llm_query_plan_total_tokens ?? 0;
+  const selectedRunLlmCost = selectedRun?.llm_query_plan_total_cost_usd ?? null;
+  const selectedRunLlmPricedBatches = selectedRun?.llm_query_plan_priced_batch_count ?? 0;
+  const selectedRunLlmResponseCostBatches = selectedRun?.llm_query_plan_response_reported_cost_count ?? 0;
   const selectedRunLlmFailureLabel = selectedRunLlmBatchCount
     ? `${compactNumber(selectedRunLlmFailureCount)} / ${compactNumber(selectedRunLlmBatchCount)}`
     : "0";
@@ -1089,6 +1116,10 @@ export default function App() {
             <Clipboard size={16} />
             LLM Plans
           </button>
+          <button className={workspaceView === "heuristic-plans" ? "active" : ""} onClick={() => setWorkspaceView("heuristic-plans")}>
+            <AlertCircle size={16} />
+            Heuristic Plans
+          </button>
           <button className={workspaceView === "monitor" ? "active" : ""} onClick={() => setWorkspaceView("monitor")}>
             <Activity size={16} />
             Run Monitor
@@ -1159,6 +1190,18 @@ export default function App() {
                 <Metric label="Missing Tasks" value={`${compactNumber(selectedRunLlmMissingTasks)} / ${compactNumber(selectedRunLlmRequestedTasks)}`} />
                 <Metric label="Returned Tasks" value={compactNumber(selectedRunLlmReturnedTasks)} />
                 <Metric label="Usable Tasks" value={compactNumber(selectedRunLlmUsableTasks)} />
+                <Metric label="Input Tokens" value={compactNumber(selectedRunLlmInputTokens)} />
+                <Metric label="Output Tokens" value={compactNumber(selectedRunLlmOutputTokens)} />
+                <Metric label="Total Tokens" value={compactNumber(selectedRunLlmTokens)} />
+                <Metric
+                  label="LLM Cost"
+                  value={selectedRunLlmPricedBatches ? compactUsd(selectedRunLlmCost) : "-"}
+                />
+              </div>
+              <div className="llm-cost-note">
+                {selectedRunLlmPricedBatches
+                  ? `${compactNumber(selectedRunLlmPricedBatches)} priced batches · ${compactNumber(selectedRunLlmResponseCostBatches)} response-reported costs`
+                  : "Cost appears only when the LLM service reports cost or a supported pricing lookup can price actual response tokens."}
               </div>
             </div>
 
@@ -1205,6 +1248,7 @@ export default function App() {
                           <b>{compactNumber(batch.usable_task_count)} usable</b>
                           <b>{compactNumber(batch.missing_task_count)} missing</b>
                           <b>{compactNumber(batch.unknown_returned_task_count)} unknown IDs</b>
+                          <b>{usageCostLabel(batch.usage_cost)}</b>
                         </span>
                       </button>
                     );
@@ -1221,6 +1265,21 @@ export default function App() {
               </div>
             </div>
           </section>
+        )}
+
+        {workspaceView === "heuristic-plans" && (
+          <HeuristicPlanPanel
+            analysis={heuristicPlanAnalysis}
+            problemOnly={heuristicProblemOnly}
+            selectedRun={selectedRun}
+            onProblemOnlyChange={setHeuristicProblemOnly}
+            onRefresh={() => selectedRunId && refreshRunData(selectedRunId)}
+            onOpenMention={async (mentionId) => {
+              setWorkspaceView("mentions");
+              const nextDetail = await api.mention(mentionId);
+              setDetail(nextDetail);
+            }}
+          />
         )}
 
         {workspaceView === "monitor" && (
@@ -1762,11 +1821,128 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
+function HeuristicPlanPanel({
+  analysis,
+  problemOnly,
+  selectedRun,
+  onProblemOnlyChange,
+  onRefresh,
+  onOpenMention
+}: {
+  analysis: HeuristicPlanAnalysis | null;
+  problemOnly: boolean;
+  selectedRun: Run | null;
+  onProblemOnlyChange: (value: boolean) => void;
+  onRefresh: () => void;
+  onOpenMention: (mentionId: number) => void;
+}) {
+  const summary = analysis?.summary ?? {};
+  const rows = analysis?.rows ?? [];
+  return (
+    <section className="heuristic-plan-grid">
+      <div className="panel heuristic-plan-summary">
+        <div className="panel-title">
+          <AlertCircle size={17} />
+          Heuristic Query Plans
+        </div>
+        <div className="llm-plan-metrics">
+          <Metric label="Heuristic Plans" value={compactNumber(summary.heuristic_plan_count)} />
+          <Metric label="Fallback Errors" value={compactNumber(summary.llm_fallback_error_count)} />
+          <Metric label="Zero Candidates" value={compactNumber(summary.zero_candidate_count)} />
+          <Metric label="Alpaca Errors" value={compactNumber(summary.retrieval_error_count)} />
+          <Metric label="Retrieval Issues" value={compactNumber(summary.retrieval_problem_count)} />
+          <Metric label="Missed" value={compactNumber(summary.missed_count)} />
+          <Metric label="Covered" value={compactNumber(summary.covered_count)} />
+          <Metric label="Coverage" value={pct(summary.coverage)} />
+        </div>
+      </div>
+
+      <div className="panel llm-plan-toolbar">
+        <div className="table-tools">
+          <div className="panel-title">Heuristic Trace</div>
+          <label className="inline-toggle">
+            <input
+              type="checkbox"
+              checked={problemOnly}
+              onChange={(event) => onProblemOnlyChange(event.target.checked)}
+            />
+            Problem mentions only
+          </label>
+          <button onClick={onRefresh}>
+            <RefreshCw size={15} />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <div className="panel heuristic-table-panel">
+        {!selectedRun ? (
+          <div className="muted metadata-empty">Select a run to inspect heuristic query plans.</div>
+        ) : !rows.length ? (
+          <div className="muted metadata-empty">No heuristic query plans match this filter.</div>
+        ) : (
+          <div className="llm-task-table-wrap">
+            <table className="heuristic-task-table">
+              <thead>
+                <tr>
+                  <th>Mention</th>
+                  <th>Query</th>
+                  <th>Retrieval</th>
+                  <th>Issue Flags</th>
+                  <th>Dataset</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr className={row.retrieval_error || row.candidate_count === 0 || !row.best_gt_rank ? "problem" : ""} key={row.id}>
+                    <td>
+                      <strong>{row.mention_text || row.lookup_text || "-"}</strong>
+                      <span>{row.primary_gt_qid || ""}</span>
+                    </td>
+                    <td>
+                      <strong>{row.optimized_query || row.lookup_text || "-"}</strong>
+                      <span>{row.query_plan_source || row.query_engine || "heuristic"}</span>
+                      {row.query_plan_error ? <span>{row.query_plan_error}</span> : null}
+                    </td>
+                    <td>
+                      <strong>{compactNumber(row.candidate_count)} candidates</strong>
+                      <span>{row.best_gt_rank ? `best rank ${row.best_gt_rank}` : row.retrieval_error ? "Alpaca error" : "not covered"}</span>
+                      {row.retrieval_error ? <span>{row.retrieval_error}</span> : null}
+                    </td>
+                    <td>
+                      {(row.troubleshooting_flags ?? []).map((flag) => (
+                        <span className="llm-task-chip missing" key={flag}>{flag.replace(/_/g, " ")}</span>
+                      ))}
+                    </td>
+                    <td>
+                      <strong>{row.dataset_id || "-"}</strong>
+                      <span>{row.table_id || ""}</span>
+                    </td>
+                    <td>
+                      <button type="button" onClick={() => onOpenMention(row.id)}>Open</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function LlmBatchInspector({ batch }: { batch: LlmQueryPlanBatch }) {
   const taskDetails = batch.task_details ?? [];
   const missingTasks = taskDetails.filter((task) => task.state === "missing" || !task.usable);
   const unknownReturnedTasks = batch.unknown_returned_tasks ?? [];
-  const hasProblem = Boolean(batch.error || batch.parse_warning || batch.response_parse_error || (batch.missing_task_count ?? 0) > 0);
+  const hasProblem = Boolean(
+    batch.error ||
+    batch.parse_warning ||
+    batch.response_parse_error ||
+    (batch.missing_task_count ?? 0) > 0
+  );
   return (
     <div className="llm-inspector-content">
       <div className="llm-inspector-head">
@@ -1784,6 +1960,12 @@ function LlmBatchInspector({ batch }: { batch: LlmQueryPlanBatch }) {
         <Metric label="Usable Plans" value={compactNumber(batch.usable_task_count)} />
         <Metric label="Missing Requested" value={compactNumber(batch.missing_task_count)} />
         <Metric label="Unknown Returned IDs" value={compactNumber(batch.unknown_returned_task_count)} />
+        <Metric label="Input Tokens" value={compactNumber(batch.usage_cost?.input_tokens ?? batch.usage_cost?.prompt_tokens)} />
+        <Metric label="Output Tokens" value={compactNumber(batch.usage_cost?.output_tokens ?? batch.usage_cost?.completion_tokens)} />
+        <Metric label="Total Tokens" value={compactNumber(batch.usage_cost?.total_tokens)} />
+        <Metric label="LLM Cost" value={usageCostLabel(batch.usage_cost)} />
+        <Metric label="Cost Source" value={costSourceLabel(batch.usage_cost)} />
+        <Metric label="Token Source" value={(batch.usage_cost?.token_source || "-").replace(/_/g, " ")} />
       </div>
 
       {(batch.error || batch.parse_warning || batch.response_parse_error) && (
@@ -1859,6 +2041,13 @@ function LlmBatchInspector({ batch }: { batch: LlmQueryPlanBatch }) {
           </div>
         </section>
       )}
+
+      {batch.usage_cost?.notes?.length ? (
+        <section className="llm-section">
+          <div className="subhead">Cost Notes</div>
+          <div className="muted metadata-empty">{batch.usage_cost.notes.join(" ")}</div>
+        </section>
+      ) : null}
 
       <details className="llm-raw-answer">
         <summary>Raw LLM answer</summary>

@@ -17,6 +17,12 @@ export type Run = {
   llm_query_plan_returned_task_count?: number;
   llm_query_plan_usable_task_count?: number;
   llm_query_plan_missing_task_count?: number;
+  llm_query_plan_prompt_tokens?: number;
+  llm_query_plan_completion_tokens?: number;
+  llm_query_plan_total_tokens?: number;
+  llm_query_plan_total_cost_usd?: number;
+  llm_query_plan_priced_batch_count?: number;
+  llm_query_plan_response_reported_cost_count?: number;
   raw_summary?: Record<string, unknown>;
 };
 
@@ -99,6 +105,12 @@ export type ExperimentJob = {
   llm_query_plan_returned_task_count?: number;
   llm_query_plan_usable_task_count?: number;
   llm_query_plan_missing_task_count?: number;
+  llm_query_plan_prompt_tokens?: number;
+  llm_query_plan_completion_tokens?: number;
+  llm_query_plan_total_tokens?: number;
+  llm_query_plan_total_cost_usd?: number;
+  llm_query_plan_priced_batch_count?: number;
+  llm_query_plan_response_reported_cost_count?: number;
   stage_progress?: Record<string, StageProgress>;
   created_at: string;
   started_at?: string;
@@ -131,10 +143,35 @@ export type LlmQueryPlanBatch = {
   parse_warning?: string | null;
   attempts?: unknown;
   usage?: unknown;
+  usage_cost?: {
+    cost_kind?: string;
+    pricing_source?: string | null;
+    total_cost_usd?: number | null;
+    input_cost_usd?: number | null;
+    output_cost_usd?: number | null;
+    prompt_cost_usd?: number | null;
+    completion_cost_usd?: number | null;
+    request_cost_usd?: number | null;
+    input_tokens?: number;
+    output_tokens?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    token_source?: string;
+    request_count?: number;
+    notes?: string[];
+  } | null;
+  heuristic_analysis?: {
+    heuristic_plan_count?: number;
+    zero_candidate_count?: number;
+    retrieval_error_count?: number;
+    heuristic_retrieval_problem_count?: number;
+  };
   response_content?: string | null;
   parsed_response?: Record<string, unknown> | null;
   task_details?: Array<{
     task_id: string;
+    mention_id?: number | null;
     mention_text?: string | null;
     lookup_text?: string | null;
     state: "usable" | "missing" | "returned_not_usable";
@@ -147,6 +184,11 @@ export type LlmQueryPlanBatch = {
     fine_type?: string | null;
     wikipedia_url?: string | null;
     dbpedia_url?: string | null;
+    candidate_count?: number | null;
+    retrieved_count?: number | null;
+    best_gt_rank?: number | null;
+    retrieval_error?: string | null;
+    troubleshooting_flags?: string[];
   }>;
   returned_tasks?: Array<{
     id?: string | null;
@@ -167,6 +209,42 @@ export type LlmQueryPlanBatch = {
     fine_type?: string | null;
     wikipedia_url?: string | null;
     dbpedia_url?: string | null;
+  }>;
+};
+
+export type HeuristicPlanAnalysis = {
+  summary: {
+    heuristic_plan_count?: number;
+    llm_fallback_error_count?: number;
+    zero_candidate_count?: number;
+    retrieval_error_count?: number;
+    retrieval_problem_count?: number;
+    missed_count?: number;
+    covered_count?: number;
+    coverage?: number;
+  };
+  rows: Array<{
+    id: number;
+    cell_key?: string | null;
+    dataset_id?: string | null;
+    table_id?: string | null;
+    row_id?: number | null;
+    col_id?: number | null;
+    mention_text?: string | null;
+    lookup_text?: string | null;
+    primary_gt_qid?: string | null;
+    candidate_count?: number;
+    retrieved_count?: number | null;
+    best_gt_rank?: number | null;
+    query_engine?: string | null;
+    query_plan_source?: string | null;
+    query_plan_error?: string | null;
+    retrieval_error?: string | null;
+    optimized_query?: string | null;
+    normalized_mention?: string | null;
+    coarse_type?: string | null;
+    fine_type?: string | null;
+    troubleshooting_flags?: string[];
   }>;
 };
 
@@ -191,6 +269,7 @@ export type LlmTestResult = {
   response_model?: string | null;
   response_provider?: string | null;
   response_usage?: unknown;
+  usage_cost?: unknown;
   response_id?: string | null;
   content?: string;
 };
@@ -202,22 +281,32 @@ export type LlmUsageEstimate = {
   estimation_method: string;
   token_estimate: {
     prompt_tokens: number;
+    input_tokens?: number;
     max_completion_tokens?: number;
     estimated_completion_tokens?: number;
+    output_tokens?: number;
     completion_tokens_per_request?: number;
     completion_token_source?: string;
     total_tokens: number;
   };
   pricing_source?: string | null;
   pricing?: {
+    input_per_token?: number | null;
+    output_per_token?: number | null;
     prompt_per_token?: number | null;
     completion_per_token?: number | null;
     request?: number | null;
+    input_per_million?: number | null;
+    output_per_million?: number | null;
     prompt_per_million?: number | null;
     completion_per_million?: number | null;
+    estimated_input_cost_usd?: number | null;
+    estimated_output_cost_usd?: number | null;
     estimated_prompt_cost_usd?: number | null;
     estimated_completion_cost_usd?: number | null;
+    estimated_subtotal_cost_usd?: number | null;
     estimated_total_cost_usd?: number | null;
+    cost_safety_multiplier?: number;
   } | null;
   model_info?: {
     id?: string;
@@ -475,6 +564,13 @@ export const api = {
       if (value !== undefined && value !== null) search.set(key, String(value));
     });
     return request<LlmQueryPlanBatch[]>(`/api/llm-query-plan-batches?${search}`);
+  },
+  heuristicPlanAnalysis: (params: { run_id: number; problem_only?: boolean; limit?: number }) => {
+    const search = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) search.set(key, String(value));
+    });
+    return request<HeuristicPlanAnalysis>(`/api/heuristic-plan-analysis?${search}`);
   },
   deleteRun: (id: number) =>
     request<{ deleted: boolean; id: number; name: string }>(`/api/runs/${id}`, {
