@@ -9,6 +9,14 @@ export type Run = {
   candidate_count: number;
   covered_count: number;
   imported_coverage?: number;
+  llm_query_plan_batch_count?: number;
+  llm_query_plan_completed_count?: number;
+  llm_query_plan_failed_count?: number;
+  llm_query_plan_incomplete_batch_count?: number;
+  llm_query_plan_requested_task_count?: number;
+  llm_query_plan_returned_task_count?: number;
+  llm_query_plan_usable_task_count?: number;
+  llm_query_plan_missing_task_count?: number;
   raw_summary?: Record<string, unknown>;
 };
 
@@ -42,6 +50,8 @@ export type ExperimentConfig = {
   llm_provider_name: string;
   llm_api_url: string;
   llm_api_key: string;
+  openrouter_api_key?: string;
+  cerebras_api_key?: string;
   llm_model: string;
   llm_reasoning_effort: string;
   llm_temperature: number;
@@ -61,7 +71,7 @@ export type StageProgress = {
   label: string;
   current: number;
   total: number;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   started_at?: string;
   elapsed_seconds?: number;
   eta_seconds?: number | null;
@@ -70,7 +80,7 @@ export type StageProgress = {
 
 export type ExperimentJob = {
   id: number;
-  status: "queued" | "running" | "completed" | "failed";
+  status: "queued" | "running" | "completed" | "failed" | "cancel_requested" | "cancelled";
   stage: string;
   progress_current: number;
   progress_total: number;
@@ -81,10 +91,83 @@ export type ExperimentJob = {
   query_plan_output_path?: string;
   imported_run_id?: number;
   imported_run_name?: string;
+  llm_query_plan_batch_count?: number;
+  llm_query_plan_completed_count?: number;
+  llm_query_plan_failed_count?: number;
+  llm_query_plan_incomplete_batch_count?: number;
+  llm_query_plan_requested_task_count?: number;
+  llm_query_plan_returned_task_count?: number;
+  llm_query_plan_usable_task_count?: number;
+  llm_query_plan_missing_task_count?: number;
   stage_progress?: Record<string, StageProgress>;
   created_at: string;
   started_at?: string;
   finished_at?: string;
+};
+
+export type LlmQueryPlanBatch = {
+  id: number;
+  run_id?: number | null;
+  job_id?: number | null;
+  provider?: string | null;
+  endpoint?: string | null;
+  model?: string | null;
+  prompt_template: string;
+  task_count: number;
+  status: string;
+  error?: string | null;
+  created_at: string;
+  returned_task_count?: number;
+  matched_returned_task_count?: number;
+  usable_task_count?: number;
+  missing_task_count?: number;
+  missing_task_ids?: string[];
+  requested_task_ids?: string[];
+  unknown_returned_task_count?: number;
+  unknown_returned_task_ids?: string[];
+  invalid_task_count?: number;
+  response_parse_error?: string | null;
+  explanation?: string;
+  parse_warning?: string | null;
+  attempts?: unknown;
+  usage?: unknown;
+  response_content?: string | null;
+  parsed_response?: Record<string, unknown> | null;
+  task_details?: Array<{
+    task_id: string;
+    mention_text?: string | null;
+    lookup_text?: string | null;
+    state: "usable" | "missing" | "returned_not_usable";
+    returned: boolean;
+    usable: boolean;
+    plan_source?: string;
+    optimized_query?: string | null;
+    normalized_mention?: string | null;
+    coarse_type?: string | null;
+    fine_type?: string | null;
+    wikipedia_url?: string | null;
+    dbpedia_url?: string | null;
+  }>;
+  returned_tasks?: Array<{
+    id?: string | null;
+    optimized_query?: string | null;
+    normalized_mention?: string | null;
+    coarse_type?: string | null;
+    fine_type?: string | null;
+    wikipedia_url?: string | null;
+    dbpedia_url?: string | null;
+    aliases?: unknown[];
+    context_expansion_terms?: unknown[];
+  }>;
+  unknown_returned_tasks?: Array<{
+    id?: string | null;
+    optimized_query?: string | null;
+    normalized_mention?: string | null;
+    coarse_type?: string | null;
+    fine_type?: string | null;
+    wikipedia_url?: string | null;
+    dbpedia_url?: string | null;
+  }>;
 };
 
 export type ConfigStatus = {
@@ -95,7 +178,21 @@ export type ConfigStatus = {
   llm_api_url?: string;
   llm_model?: string;
   openrouter_configured: boolean;
+  cerebras_configured?: boolean;
   openrouter_allow_fallbacks?: boolean;
+};
+
+export type LlmTestResult = {
+  ok: boolean;
+  provider?: string | null;
+  provider_name?: string | null;
+  endpoint?: string | null;
+  model?: string | null;
+  response_model?: string | null;
+  response_provider?: string | null;
+  response_usage?: unknown;
+  response_id?: string | null;
+  content?: string;
 };
 
 export type LlmUsageEstimate = {
@@ -149,6 +246,20 @@ export type SourceDataset = {
   metadata?: Record<string, unknown>;
 };
 
+export type SourceDiscoveryResult = {
+  seeded: boolean;
+  reason?: string;
+  source_root: string;
+  requested_datasets: string[];
+  imported: Array<{
+    dataset_id: string;
+    table_count: number;
+    mention_count: number;
+  }>;
+  warnings: string[];
+  inventory: SourceDataset[];
+};
+
 export type DatabaseSize = {
   database_name: string;
   total_bytes: number;
@@ -180,14 +291,6 @@ export type MentionRow = {
   mention?: string;
   lookup_text?: string;
   primary_gt_qid?: string;
-  selected_qid?: string;
-  selected_label?: string;
-  final_correct?: boolean;
-  coverage_correct?: boolean;
-  hit_at_1?: boolean;
-  hit_at_5?: boolean;
-  hit_at_10?: boolean;
-  hit_at_k?: boolean;
   best_gt_rank?: number;
   retrieved_count?: number;
   candidate_count?: number;
@@ -233,7 +336,6 @@ export type Candidate = {
   score?: number;
   es_score?: number;
   heuristic_score?: number;
-  selected?: boolean;
   gold_match?: boolean;
   raw_payload?: Record<string, unknown>;
 };
@@ -298,12 +400,15 @@ export type MentionDetail = {
   feedback: FeedbackNote[];
   live_attempts: LiveAttempt[];
   table_context?: TableContext;
+  query_plan_batch?: Record<string, unknown> | null;
 };
 
 export type GoldMetadataResult = {
   requested_qids: string[];
   resolved_qid?: string | null;
   entity?: Candidate | null;
+  entities?: Candidate[];
+  ner_types?: Array<{ qid?: string; coarse_type?: string | null; fine_type?: string | null }>;
   all_found_qids: string[];
 };
 
@@ -335,11 +440,25 @@ export const api = {
   experimentDefaults: () => request<ExperimentConfig>("/api/experiment-defaults"),
   configStatus: () => request<ConfigStatus>("/api/config-status"),
   sourceDatasets: () => request<SourceDataset[]>("/api/source-datasets"),
+  discoverSourceDatasets: (body: { source_root?: string; requested_datasets?: string[]; force?: boolean } = {}) =>
+    request<SourceDiscoveryResult>("/api/source-datasets/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }),
   databaseSize: () => request<DatabaseSize>("/api/database-size"),
   experimentJobs: () => request<ExperimentJob[]>("/api/experiment-jobs"),
   experimentJob: (id: number) => request<ExperimentJob>(`/api/experiment-jobs/${id}`),
+  cancelExperimentJob: (id: number) =>
+    request<ExperimentJob>(`/api/experiment-jobs/${id}/cancel`, {
+      method: "POST"
+    }),
   clearFailedExperimentJobs: () =>
     request<{ deleted: number }>("/api/experiment-jobs/failed", {
+      method: "DELETE"
+    }),
+  deleteExperimentJob: (id: number) =>
+    request<{ deleted: boolean; id: number; status: string; imported_run_id?: number | null }>(`/api/experiment-jobs/${id}`, {
       method: "DELETE"
     }),
   startExperimentJob: (config: Partial<ExperimentConfig>) =>
@@ -350,6 +469,17 @@ export const api = {
     }),
   runs: () => request<Run[]>("/api/runs"),
   run: (id: number) => request<Run>(`/api/runs/${id}`),
+  llmQueryPlanBatches: (params: { run_id?: number; job_id?: number; problem_only?: boolean; limit?: number; include_details?: boolean }) => {
+    const search = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) search.set(key, String(value));
+    });
+    return request<LlmQueryPlanBatch[]>(`/api/llm-query-plan-batches?${search}`);
+  },
+  deleteRun: (id: number) =>
+    request<{ deleted: boolean; id: number; name: string }>(`/api/runs/${id}`, {
+      method: "DELETE"
+    }),
   filters: (id: number) => request<Filters>(`/api/runs/${id}/filters`),
   coverage: (id: number) => request<CoveragePoint[]>(`/api/runs/${id}/coverage`),
   mentions: (
@@ -375,6 +505,12 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
+    }),
+  testLlm: (config: Partial<ExperimentConfig>) =>
+    request<LlmTestResult>("/api/llm/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config })
     }),
   estimateExperiment: (config: Partial<ExperimentConfig>) =>
     request<LlmUsageEstimate>("/api/experiment-estimate", {

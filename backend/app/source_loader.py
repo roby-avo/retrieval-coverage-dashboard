@@ -188,6 +188,10 @@ def _requested_datasets(source_root: Path) -> list[str]:
     return requested
 
 
+def requested_source_datasets(source_root: Path) -> list[str]:
+    return _requested_datasets(source_root)
+
+
 def _source_path(source_root: Path, path: Path) -> tuple[str, str]:
     relative_path = path.relative_to(source_root).as_posix()
     return f"/source-data/{relative_path}", relative_path
@@ -340,7 +344,7 @@ def seed_source_data(*, source_root: Path, requested_datasets: Sequence[str], fo
 def main() -> None:
     source_root = Path(os.environ.get("SOURCE_DATA_ROOT", "/source-data"))
     force = os.environ.get("SOURCE_DATA_FORCE", "0").strip().lower() in {"1", "true", "yes"}
-    result = seed_source_data(source_root=source_root, requested_datasets=_requested_datasets(source_root), force=force)
+    result = seed_source_data(source_root=source_root, requested_datasets=requested_source_datasets(source_root), force=force)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

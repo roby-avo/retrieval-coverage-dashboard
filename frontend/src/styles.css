@@ -328,6 +328,42 @@ td span {
   background: rgba(146, 64, 14, 0.55);
 }
 
+.source-discovery {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.compact-checkbox {
+  min-height: 2.25rem;
+  color: #d9e3f0;
+  font-size: 0.78rem;
+}
+
+.discovery-warnings {
+  border: 1px solid rgba(217, 119, 6, 0.35);
+  border-radius: 6px;
+  background: rgba(254, 243, 199, 0.12);
+  color: #fde68a;
+  font-size: 0.78rem;
+}
+
+.discovery-warnings summary {
+  cursor: pointer;
+  padding: 0.5rem 0.6rem;
+}
+
+.discovery-warnings pre {
+  max-height: 7rem;
+  overflow: auto;
+  margin: 0;
+  padding: 0 0.6rem 0.6rem;
+  white-space: pre-wrap;
+  color: #fef3c7;
+  font-size: 0.7rem;
+}
+
 .secondary-panel {
   opacity: 0.94;
 }
@@ -413,6 +449,12 @@ td span {
   background: #231f32;
 }
 
+.job-card.cancel_requested,
+.job-card.cancelled {
+  border-color: rgba(251, 191, 36, 0.65);
+  background: #252236;
+}
+
 .job-card.running,
 .job-card.queued {
   border-color: rgba(20, 184, 166, 0.58);
@@ -465,6 +507,12 @@ td span {
 .job-status.failed {
   color: #fee2e2;
   background: rgba(180, 35, 24, 0.55);
+}
+
+.job-status.cancel_requested,
+.job-status.cancelled {
+  color: #fef3c7;
+  background: rgba(146, 64, 14, 0.58);
 }
 
 .progress-track {
@@ -539,6 +587,10 @@ td span {
   background: var(--red);
 }
 
+.stage-progress.cancelled .progress-fill {
+  background: #d97706;
+}
+
 .job-error {
   color: #fecaca;
   font-size: 0.78rem;
@@ -606,6 +658,363 @@ td span {
   gap: 1rem;
 }
 
+.llm-plan-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.llm-plan-summary,
+.llm-plan-toolbar,
+.llm-batch-list-panel,
+.llm-batch-inspector {
+  min-width: 0;
+}
+
+.llm-plan-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(7rem, 1fr));
+  gap: 0.75rem;
+}
+
+.inline-toggle {
+  width: auto;
+  min-height: 2.25rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.inline-toggle input {
+  width: auto;
+  min-height: auto;
+  margin: 0;
+}
+
+.llm-batch-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.llm-plan-workbench {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(18rem, 24rem) minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.llm-batch-list-panel,
+.llm-batch-inspector {
+  min-height: 0;
+  overflow: auto;
+}
+
+.llm-batch-card {
+  width: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-content: stretch;
+  gap: 0.45rem;
+  border-color: var(--line);
+  background: var(--panel-soft);
+  padding: 0.7rem;
+  text-align: left;
+}
+
+.llm-batch-card.problem {
+  border-color: rgba(180, 35, 24, 0.35);
+  background: #fff7f7;
+}
+
+.llm-batch-card.clean {
+  border-color: rgba(22, 101, 52, 0.25);
+  background: #f7fdf9;
+}
+
+.llm-batch-card.selected {
+  outline: 2px solid rgba(15, 118, 110, 0.32);
+  border-color: var(--teal);
+}
+
+.llm-batch-card span {
+  min-width: 0;
+  display: grid;
+  gap: 0.15rem;
+}
+
+.llm-batch-card em {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llm-batch-card-counts {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.llm-batch-card-counts b {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #fff;
+  padding: 0.22rem 0.35rem;
+  font-size: 0.7rem;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llm-inspector-content {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.llm-inspector-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: start;
+}
+
+.llm-inspector-head p {
+  margin: -0.35rem 0 0;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.llm-status-pill {
+  border-radius: 999px;
+  padding: 0.28rem 0.6rem;
+  font-size: 0.72rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.llm-status-pill.problem {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.llm-status-pill.clean {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.llm-diagnosis-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(6rem, 1fr));
+  gap: 0.65rem;
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.llm-alert {
+  border: 1px solid rgba(180, 35, 24, 0.28);
+  border-radius: 6px;
+  background: #fff7f7;
+  color: var(--red);
+  padding: 0.65rem 0.75rem;
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
+.llm-section {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.llm-task-table-wrap {
+  max-height: 26rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.llm-task-table {
+  min-width: 56rem;
+}
+
+.llm-task-table th {
+  position: sticky;
+  top: 0;
+  background: #fff;
+  z-index: 1;
+}
+
+.llm-task-table tr.problem {
+  background: #fff7f7;
+}
+
+.llm-task-table td {
+  vertical-align: top;
+}
+
+.llm-task-table td strong,
+.llm-task-table td span {
+  display: block;
+}
+
+.llm-task-table td span {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.llm-task-table code {
+  color: #344054;
+  font-size: 0.72rem;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.llm-task-state {
+  display: inline-flex;
+  border-radius: 999px;
+  padding: 0.16rem 0.45rem;
+  font-size: 0.7rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.llm-task-state.usable {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.llm-task-state.missing,
+.llm-task-state.returned-not-usable {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.llm-task-chips {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.llm-task-chip {
+  border-radius: 999px;
+  padding: 0.2rem 0.48rem;
+  font-size: 0.74rem;
+  font-weight: 720;
+}
+
+.llm-task-chip.missing {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.llm-task-chip.unknown {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.llm-raw-answer {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.llm-raw-answer summary {
+  cursor: pointer;
+  padding: 0.65rem 0.75rem;
+  font-weight: 760;
+}
+
+.llm-raw-answer pre {
+  max-height: 22rem;
+  overflow: auto;
+  margin: 0;
+  border-top: 1px solid var(--line);
+  background: #fff;
+  padding: 0.75rem;
+  color: #344054;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.llm-batch {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.llm-batch.problem {
+  border-color: rgba(180, 35, 24, 0.34);
+  background: #fff7f7;
+}
+
+.llm-batch-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(14rem, 18rem);
+  gap: 1rem;
+  align-items: start;
+}
+
+.llm-batch-head > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 0.15rem;
+}
+
+.llm-batch-head strong {
+  font-size: 0.95rem;
+}
+
+.llm-batch-head span,
+.llm-batch-message,
+.llm-batch-ids span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.llm-batch-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.llm-batch-message {
+  border-top: 1px solid var(--line);
+  padding-top: 0.55rem;
+  line-height: 1.35;
+}
+
+.llm-batch-ids {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.llm-batch-ids code {
+  max-height: 4.25rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #fff;
+  padding: 0.5rem;
+  color: #344054;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .monitor-grid {
   min-height: 0;
   display: grid;
@@ -643,6 +1052,12 @@ td span {
 .monitor-job.failed {
   border-color: rgba(180, 35, 24, 0.38);
   background: #fff7f7;
+}
+
+.monitor-job.cancel_requested,
+.monitor-job.cancelled {
+  border-color: rgba(217, 119, 6, 0.38);
+  background: #fffbeb;
 }
 
 .monitor-job-head {
@@ -720,6 +1135,26 @@ td span {
   font-weight: 700;
 }
 
+.settings-test {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.86rem;
+  font-weight: 700;
+  padding: 0.65rem 0.75rem;
+}
+
+.settings-test.ok {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.settings-test.warn {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #9a3412;
+}
+
 .settings-side {
   display: grid;
   align-content: start;
@@ -768,6 +1203,25 @@ td span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.stage-row.tall {
+  align-items: start;
+}
+
+.stage-row.tall span {
+  display: grid;
+  gap: 0.2rem;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.stage-row.tall em {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-style: normal;
+  line-height: 1.25;
 }
 
 .split {
@@ -1323,6 +1777,9 @@ td span {
 
   .split,
   .analysis-grid,
+  .llm-plan-metrics,
+  .llm-plan-workbench,
+  .llm-diagnosis-grid,
   .settings-grid {
     grid-template-columns: 1fr;
   }
@@ -1332,6 +1789,9 @@ td span {
   .sidebar,
   .topline,
   .stat-strip,
+  .llm-batch-head,
+  .llm-batch-counts,
+  .llm-inspector-head,
   .table-tools,
   .kv-grid,
   .live-grid,

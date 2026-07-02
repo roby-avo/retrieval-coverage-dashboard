@@ -73,6 +73,34 @@ def _clean_string(value: Any) -> str | None:
     return text or None
 
 
+def normalize_cache_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def normalize_query_plan_source(value: Any) -> str:
+    normalized = normalize_cache_text(value)
+    if normalized == "heuristic" or "heuristic" in normalized or normalized in {"guidance_not_applied_without_llm"}:
+        return "heuristic"
+    if normalized in {"", "none", "off", "disabled", "false", "legacy"}:
+        return "legacy"
+    return "llm"
+
+
+def candidate_retrieval_cache_key(mention_text: Any, query_text: Any, query_plan_source: Any = "legacy") -> str | None:
+    normalized_mention = normalize_cache_text(mention_text)
+    normalized_query = normalize_cache_text(query_text)
+    normalized_source = normalize_query_plan_source(query_plan_source)
+    if not normalized_mention or not normalized_query:
+        return None
+    canonical = json.dumps(
+        {"mention": normalized_mention, "query": normalized_query, "query_plan_source": normalized_source},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _clean_string_list(value: Any, *, limit: int = 8) -> list[str]:
     if isinstance(value, str):
         raw_values = [value]
@@ -126,9 +154,7 @@ def build_alpaca_query(query_text: str, retrieval_signals: dict[str, Any] | None
     ):
         optimized_query = typo_corrected_mention
     normalized_mention = _clean_string(signals.get("normalized_mention"))
-    context_text = _clean_string(signals.get("context_text"))
     aliases = _clean_string_list(signals.get("aliases"), limit=10)
-    expansion_terms = _clean_string_list(signals.get("context_expansion_terms"), limit=6)
     should: list[dict[str, Any]] = [
         {
             "multi_match": {
@@ -162,30 +188,6 @@ def build_alpaca_query(query_text: str, retrieval_signals: dict[str, Any] | None
                     "fields": ["aliases^6", "labels^4", "label^4", "search_text"],
                     "type": "phrase",
                     "boost": 3.0,
-                }
-            }
-        )
-
-    if context_text:
-        should.append(
-            {
-                "multi_match": {
-                    "query": context_text,
-                    "fields": ["context_string^2", "description^1.5", "search_text"],
-                    "operator": "or",
-                    "boost": 1.0,
-                }
-            }
-        )
-
-    for term in expansion_terms:
-        should.append(
-            {
-                "multi_match": {
-                    "query": term,
-                    "fields": ["context_string^2", "description^1.5", "aliases", "search_text"],
-                    "operator": "or",
-                    "boost": 0.75,
                 }
             }
         )
@@ -246,30 +248,32 @@ def _slice_alpaca_response(response: dict[str, Any], size: int) -> dict[str, Any
     return result
 
 
-def _cached_alpaca_response(fingerprint: str, size: int) -> dict[str, Any] | None:
-    if not ALPACA_SEARCH_CACHE_ENABLED:
+def _cached_candidate_retrieval_response(mention_text: Any, query_text: Any, query_plan_source: Any, size: int) -> dict[str, Any] | None:
+    cache_key = candidate_retrieval_cache_key(mention_text, query_text, query_plan_source)
+    if not cache_key:
         return None
     requested_size = bounded_candidate_count(size)
     with connect() as conn:
         row = conn.execute(
             """
             SELECT response_payload, cached_candidate_count
-            FROM alpaca_search_cache
-            WHERE fingerprint = %s
+            FROM candidate_retrieval_cache
+            WHERE cache_key = %s
+              AND query_plan_source = %s
               AND cached_candidate_count >= %s
             """,
-            (fingerprint, requested_size),
+            (cache_key, normalize_query_plan_source(query_plan_source), requested_size),
         ).fetchone()
         if not row:
             return None
         conn.execute(
             """
-            UPDATE alpaca_search_cache
+            UPDATE candidate_retrieval_cache
             SET hit_count = hit_count + 1,
                 last_hit_at = now()
-            WHERE fingerprint = %s
+            WHERE cache_key = %s
             """,
-            (fingerprint,),
+            (cache_key,),
         )
         conn.commit()
 
@@ -279,36 +283,57 @@ def _cached_alpaca_response(fingerprint: str, size: int) -> dict[str, Any] | Non
     return _slice_alpaca_response(response, requested_size)
 
 
-def _store_alpaca_response(fingerprint: str, query_body: dict[str, Any], size: int, response: dict[str, Any]) -> None:
-    if not ALPACA_SEARCH_CACHE_ENABLED:
+def _store_candidate_retrieval_response(
+    *,
+    mention_text: Any,
+    query_text: Any,
+    query_plan_source: Any,
+    query_body: dict[str, Any],
+    size: int,
+    response: dict[str, Any],
+) -> None:
+    cache_key = candidate_retrieval_cache_key(mention_text, query_text, query_plan_source)
+    if not cache_key:
         return
     requested_size = bounded_candidate_count(size)
+    normalized_mention = normalize_cache_text(mention_text)
+    normalized_query = normalize_cache_text(query_text)
+    normalized_source = normalize_query_plan_source(query_plan_source)
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO alpaca_search_cache (
-                fingerprint, query_payload, response_payload, cached_candidate_count
+            INSERT INTO candidate_retrieval_cache (
+                cache_key, mention_text, normalized_mention, query_text, normalized_query,
+                query_plan_source, query_payload, response_payload, cached_candidate_count
             )
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (fingerprint) DO UPDATE
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (cache_key) DO UPDATE
             SET response_payload = CASE
-                    WHEN alpaca_search_cache.cached_candidate_count < EXCLUDED.cached_candidate_count
+                    WHEN candidate_retrieval_cache.cached_candidate_count < EXCLUDED.cached_candidate_count
                     THEN EXCLUDED.response_payload
-                    ELSE alpaca_search_cache.response_payload
+                    ELSE candidate_retrieval_cache.response_payload
                 END,
                 cached_candidate_count = greatest(
-                    alpaca_search_cache.cached_candidate_count,
+                    candidate_retrieval_cache.cached_candidate_count,
                     EXCLUDED.cached_candidate_count
                 ),
                 query_payload = CASE
-                    WHEN alpaca_search_cache.cached_candidate_count < EXCLUDED.cached_candidate_count
+                    WHEN candidate_retrieval_cache.cached_candidate_count < EXCLUDED.cached_candidate_count
                     THEN EXCLUDED.query_payload
-                    ELSE alpaca_search_cache.query_payload
+                    ELSE candidate_retrieval_cache.query_payload
                 END,
+                mention_text = EXCLUDED.mention_text,
+                query_text = EXCLUDED.query_text,
+                query_plan_source = EXCLUDED.query_plan_source,
                 last_cached_at = now()
             """,
             (
-                fingerprint,
+                cache_key,
+                str(mention_text or "").strip(),
+                normalized_mention,
+                str(query_text or "").strip(),
+                normalized_query,
+                normalized_source,
                 Jsonb(_canonical_alpaca_query_payload(query_body)),
                 Jsonb(response),
                 requested_size,
@@ -317,102 +342,19 @@ def _store_alpaca_response(fingerprint: str, query_body: dict[str, Any], size: i
         conn.commit()
 
 
-def _candidate_hit_from_row(row: dict[str, Any]) -> dict[str, Any]:
-    source = row.get("raw_payload")
-    if not isinstance(source, dict):
-        source = {
-            "qid": row.get("qid"),
-            "label": row.get("label"),
-            "item_category": row.get("item_category"),
-            "coarse_type": row.get("coarse_type"),
-            "fine_type": row.get("fine_type"),
-            "rank": row.get("rank"),
-            "es_rank": row.get("source_rank"),
-            "score": row.get("score"),
-            "es_score": row.get("es_score"),
-            "heuristic_score": row.get("heuristic_score"),
-            "retrieval_system": row.get("retrieval_system"),
-            "retrieval_stage": row.get("retrieval_stage"),
-            "retrieval_stages": row.get("retrieval_stages") or [],
-        }
-    else:
-        source = dict(source)
-        source.setdefault("qid", row.get("qid"))
-        source.setdefault("label", row.get("label"))
-        source.setdefault("item_category", row.get("item_category"))
-        source.setdefault("coarse_type", row.get("coarse_type"))
-        source.setdefault("fine_type", row.get("fine_type"))
-        source.setdefault("rank", row.get("rank"))
-        source.setdefault("es_rank", row.get("source_rank"))
-        source.setdefault("es_score", row.get("es_score"))
-
-    hit: dict[str, Any] = {"_source": source}
-    if row.get("qid"):
-        hit["_id"] = row["qid"]
-    score = row.get("es_score")
-    if score is None:
-        score = row.get("score")
-    if score is not None:
-        hit["_score"] = score
-    return hit
-
-
-def _response_from_candidate_rows(rows: list[dict[str, Any]], cached_candidate_count: int) -> dict[str, Any]:
-    return {
-        "hits": {
-            "total": {"value": cached_candidate_count, "relation": "eq"},
-            "hits": [_candidate_hit_from_row(row) for row in rows],
-        }
-    }
-
-
-def _cached_candidate_response(fingerprint: str, query_body: dict[str, Any], size: int) -> dict[str, Any] | None:
-    if not ALPACA_SEARCH_CACHE_ENABLED:
-        return None
-    requested_size = bounded_candidate_count(size)
-    with connect() as conn:
-        mention = conn.execute(
-            """
-            SELECT id, retrieval_cache_candidate_count
-            FROM mentions
-            WHERE retrieval_fingerprint = %s
-              AND retrieval_cache_candidate_count >= %s
-            ORDER BY retrieval_cache_candidate_count DESC, id DESC
-            LIMIT 1
-            """,
-            (fingerprint, requested_size),
-        ).fetchone()
-        if not mention:
-            return None
-        rows = conn.execute(
-            """
-            SELECT rank, source_rank, qid, label, item_category, coarse_type, fine_type,
-                   retrieval_system, retrieval_stage, retrieval_stages, score, es_score,
-                   heuristic_score, raw_payload
-            FROM candidates
-            WHERE mention_id = %s
-            ORDER BY rank
-            LIMIT %s
-            """,
-            (mention["id"], MAX_RETRIEVAL_CANDIDATES),
-        ).fetchall()
-
-    if len(rows) < requested_size:
-        return None
-    cached_candidate_count = min(int(mention["retrieval_cache_candidate_count"] or len(rows)), len(rows))
-    response = _response_from_candidate_rows(list(rows), cached_candidate_count)
-    _store_alpaca_response(fingerprint, query_body, cached_candidate_count, response)
-    return _slice_alpaca_response(response, requested_size)
-
-
-def alpaca_search(query_body: dict[str, Any], size: int) -> dict[str, Any]:
-    fingerprint = _alpaca_query_fingerprint(query_body)
-    cached_response = _cached_alpaca_response(fingerprint, size)
-    if cached_response is not None:
-        return cached_response
-    cached_response = _cached_candidate_response(fingerprint, query_body, size)
-    if cached_response is not None:
-        return cached_response
+def alpaca_search(
+    query_body: dict[str, Any],
+    size: int,
+    *,
+    mention_text: Any | None = None,
+    query_text: Any | None = None,
+    query_plan_source: Any | None = None,
+) -> dict[str, Any]:
+    use_candidate_cache = mention_text is not None and query_text is not None and query_plan_source is not None
+    if use_candidate_cache:
+        cached_candidate_response = _cached_candidate_retrieval_response(mention_text, query_text, query_plan_source, size)
+        if cached_candidate_response is not None:
+            return cached_candidate_response
 
     token = alpaca_token()
     if not token:
@@ -434,7 +376,15 @@ def alpaca_search(query_body: dict[str, Any], size: int) -> dict[str, Any]:
     try:
         with urlopen(request, timeout=60) as response:
             response_payload = json.loads(response.read() or b"{}")
-            _store_alpaca_response(fingerprint, query_body, payload["size"], response_payload)
+            if mention_text is not None and query_text is not None:
+                _store_candidate_retrieval_response(
+                    mention_text=mention_text,
+                    query_text=query_text,
+                    query_plan_source=query_plan_source,
+                    query_body=query_body,
+                    size=payload["size"],
+                    response=response_payload,
+                )
             return response_payload
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -454,6 +404,7 @@ def extract_hits(response: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         source = hit.get("_source") if isinstance(hit.get("_source"), dict) else hit
         candidate = dict(source)
+        candidate.setdefault("qid", hit.get("_id"))
         candidate["rank"] = index
         candidate["es_rank"] = index
         candidate["es_score"] = hit.get("_score", candidate.get("es_score"))

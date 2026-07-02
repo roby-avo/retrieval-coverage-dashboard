@@ -1,11 +1,12 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .retrieval import MAX_RETURNED_CANDIDATES, alpaca_query_fingerprint
+from .retrieval import MAX_RETURNED_CANDIDATES, candidate_retrieval_cache_key
 
 
 @dataclass
@@ -30,15 +31,6 @@ def _as_int(value: Any) -> int | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _as_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -77,26 +69,6 @@ def _clean_qids(values: Any) -> list[str]:
     return qids
 
 
-def _candidate_stages(candidate: dict[str, Any]) -> list[str]:
-    raw = candidate.get("retrieval_stages")
-    if isinstance(raw, str):
-        raw = [raw]
-    stages: list[str] = []
-    if isinstance(raw, list | tuple):
-        stages.extend(str(item) for item in raw if item)
-    if candidate.get("retrieval_stage"):
-        stages.insert(0, str(candidate["retrieval_stage"]))
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for stage in stages:
-        if stage in seen:
-            continue
-        seen.add(stage)
-        result.append(stage)
-    return result
-
-
 def _entity_by_qid(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
     entities = row.get("gt_entities")
     if not isinstance(entities, list):
@@ -111,41 +83,38 @@ def _entity_by_qid(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _mention_metadata(row: dict[str, Any]) -> dict[str, Any]:
-    duplicated_ranked_payloads = {"candidates", "reranked"}
-    return {key: value for key, value in row.items() if key not in duplicated_ranked_payloads}
-
-
 def _limited_candidates(row: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = row.get("candidates")
     if not isinstance(candidates, list):
         return []
-
-    limited: list[dict[str, Any]] = []
-    for candidate in candidates:
-        if isinstance(candidate, dict):
-            limited.append(candidate)
-        if len(limited) >= MAX_RETURNED_CANDIDATES:
-            break
-    return limited
+    return [candidate for candidate in candidates[:MAX_RETURNED_CANDIDATES] if isinstance(candidate, dict)]
 
 
-def _alpaca_request_payload(row: dict[str, Any]) -> dict[str, Any] | None:
-    backend_requests = row.get("backend_requests")
-    if not isinstance(backend_requests, list) or not backend_requests:
+def _mention_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    duplicated_payloads = {"candidates", "reranked", "backend_response"}
+    return {key: value for key, value in row.items() if key not in duplicated_payloads}
+
+
+def _query_plan_batch_id(row: dict[str, Any]) -> int | None:
+    query_plan = row.get("query_plan")
+    if not isinstance(query_plan, dict):
         return None
-    first_request = backend_requests[0]
-    if not isinstance(first_request, dict):
+    llm_inspection = query_plan.get("llm_inspection")
+    if not isinstance(llm_inspection, dict):
         return None
-    request_payload = first_request.get("request")
-    return request_payload if isinstance(request_payload, dict) else None
+    return _as_int(llm_inspection.get("batch_id"))
 
 
-def _retrieval_fingerprint(row: dict[str, Any]) -> str | None:
-    request_payload = _alpaca_request_payload(row)
-    if not request_payload:
+def _candidate_cache_key(row: dict[str, Any]) -> str | None:
+    if not _limited_candidates(row):
         return None
-    return alpaca_query_fingerprint(request_payload)
+    query_text = row.get("query_text")
+    if not query_text and isinstance(row.get("query_plan"), dict):
+        query_text = row["query_plan"].get("optimized_query")
+    query_plan_source = row.get("query_engine")
+    if not query_plan_source and isinstance(row.get("query_plan"), dict):
+        query_plan_source = row["query_plan"].get("query_plan_source")
+    return candidate_retrieval_cache_key(row.get("mention_text") or row.get("lookup_text"), query_text, query_plan_source or "heuristic")
 
 
 def create_import_run(
@@ -227,21 +196,20 @@ def import_experiment_row(
     row: dict[str, Any],
 ) -> RowImportStats:
     qids = _clean_qids(row.get("gold_qids") or row.get("gt_qids") or [])
-    candidates = _limited_candidates(row)
-    retrieval_fingerprint = _retrieval_fingerprint(row)
+    candidate_count = len(_limited_candidates(row))
+    best_gt_rank = _as_int(row.get("best_gt_rank") or row.get("gold_rank"))
+    candidate_cache_key = _candidate_cache_key(row)
+    query_plan_batch_id = _query_plan_batch_id(row)
     mention = conn.execute(
         """
         INSERT INTO mentions (
-            run_id, table_db_id, cell_key, dataset_id, table_id, row_id, col_id,
-            mention, mention_text, lookup_text, primary_gt_qid, selected_qid,
-            selected_label, final_correct, coverage_correct, hit_at_1, hit_at_5,
-            hit_at_10, hit_at_k, best_gt_rank, retrieved_count, candidate_count,
-            candidate_backend, query_engine, raw_payload, retrieval_fingerprint,
-            retrieval_cache_candidate_count
+            run_id, table_db_id, query_plan_batch_id, candidate_cache_key,
+            cell_key, dataset_id, table_id, row_id, col_id, mention_text,
+            lookup_text, primary_gt_qid, best_gt_rank, retrieved_count,
+            candidate_count, candidate_backend, query_engine, raw_payload
         )
         VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (run_id, cell_key) DO NOTHING
         RETURNING id
@@ -249,37 +217,39 @@ def import_experiment_row(
         (
             run_id,
             table_db_id,
+            query_plan_batch_id,
+            candidate_cache_key,
             _as_text(row.get("cell_key")),
             _as_text(row.get("dataset_id")),
             _as_text(row.get("table_id")),
             _as_int(row.get("row_id")),
             _as_int(row.get("col_id")),
-            _as_text(row.get("mention")),
-            _as_text(row.get("mention_text")),
+            _as_text(row.get("mention_text") or row.get("mention")),
             _as_text(row.get("lookup_text")),
             _as_text(row.get("primary_gt_qid")) or (qids[0] if qids else None),
-            _as_text(row.get("selected_qid")),
-            _as_text(row.get("selected_label")),
-            _as_bool(row.get("final_correct")),
-            _as_bool(row.get("coverage_correct")),
-            _as_bool(row.get("hit_at_1")),
-            _as_bool(row.get("hit_at_5")),
-            _as_bool(row.get("hit_at_10")),
-            _as_bool(row.get("hit_at_k")),
-            _as_int(row.get("best_gt_rank") or row.get("gold_rank")),
-            _as_int(row.get("retrieved_count")),
-            _as_int(row.get("candidate_count")),
+            best_gt_rank,
+            _as_int(row.get("retrieved_count")) or candidate_count,
+            candidate_count,
             _as_text(row.get("candidate_backend")),
             _as_text(row.get("query_engine")),
             Jsonb(_mention_metadata(row)),
-            retrieval_fingerprint,
-            len(candidates),
         ),
     ).fetchone()
     if not mention:
         return RowImportStats(mention_count=0, candidate_count=0, covered_count=0)
 
     mention_id = int(mention["id"])
+    if query_plan_batch_id:
+        conn.execute(
+            """
+            UPDATE llm_prompt_tasks
+            SET mention_id = %s
+            WHERE batch_id = %s
+              AND task_id = %s
+            """,
+            (mention_id, query_plan_batch_id, _as_text(row.get("cell_key"))),
+        )
+
     raw_entities = _entity_by_qid(row)
     primary_qid = _as_text(row.get("primary_gt_qid")) or (qids[0] if qids else None)
     gold_rows = [
@@ -302,55 +272,11 @@ def import_experiment_row(
             gold_rows,
         )
 
-    candidate_count = 0
-    if candidates:
-        candidate_rows = []
-        qid_set = set(qids)
-        for rank, candidate in enumerate(candidates, start=1):
-            candidate_qid = _as_text(candidate.get("qid"))
-            stages = _candidate_stages(candidate)
-            candidate_rows.append(
-                (
-                    mention_id,
-                    rank,
-                    _as_int(candidate.get("rank") or candidate.get("merged_rank") or candidate.get("es_rank")),
-                    candidate_qid,
-                    _as_text(candidate.get("label")),
-                    _as_text(candidate.get("item_category")),
-                    _as_text(candidate.get("coarse_type")),
-                    _as_text(candidate.get("fine_type")),
-                    _as_text(candidate.get("retrieval_system"))
-                    or _as_text(row.get("candidate_backend"))
-                    or _as_text(row.get("query_engine")),
-                    stages[0] if stages else _as_text(candidate.get("retrieval_stage")),
-                    stages,
-                    _as_float(candidate.get("score") or candidate.get("final_score")),
-                    _as_float(candidate.get("es_score")),
-                    _as_float(candidate.get("heuristic_score")),
-                    bool(candidate.get("isSelected")),
-                    bool(candidate.get("isGold")) or bool(candidate_qid and candidate_qid in qid_set),
-                    Jsonb(candidate),
-                )
-            )
-
-        if candidate_rows:
-            conn.cursor().executemany(
-                """
-                INSERT INTO candidates (
-                    mention_id, rank, source_rank, qid, label, item_category, coarse_type,
-                    fine_type, retrieval_system, retrieval_stage, retrieval_stages, score,
-                    es_score, heuristic_score, selected, gold_match, raw_payload
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                )
-                """,
-                candidate_rows,
-            )
-            candidate_count = len(candidate_rows)
-
-    covered = bool(row.get("hit_at_k") or row.get("coverage_correct"))
-    return RowImportStats(mention_count=1, candidate_count=candidate_count, covered_count=1 if covered else 0)
+    return RowImportStats(
+        mention_count=1,
+        candidate_count=candidate_count,
+        covered_count=1 if best_gt_rank is not None else 0,
+    )
 
 
 def update_run_counters(
@@ -386,28 +312,13 @@ def finalize_import_run(
         SELECT
             (SELECT count(*) FROM experiment_tables WHERE run_id = %s) AS table_count,
             (SELECT count(*) FROM mentions WHERE run_id = %s) AS mention_count,
-            (SELECT count(*) FROM candidates c JOIN mentions m ON m.id = c.mention_id WHERE m.run_id = %s) AS candidate_count,
-            (
-                SELECT count(*)
-                FROM mentions m
-                WHERE m.run_id = %s
-                  AND (
-                    coalesce(m.coverage_correct, false)
-                    OR m.best_gt_rank IS NOT NULL
-                    OR EXISTS (
-                      SELECT 1
-                      FROM candidates c
-                      JOIN gold_qids g ON g.mention_id = m.id AND g.qid = c.qid
-                      WHERE c.mention_id = m.id
-                    )
-                  )
-            ) AS covered_count
+            (SELECT coalesce(sum(candidate_count), 0) FROM mentions WHERE run_id = %s) AS candidate_count,
+            (SELECT count(*) FROM mentions WHERE run_id = %s AND best_gt_rank IS NOT NULL) AS covered_count
         """,
         (run_id, run_id, run_id, run_id),
     ).fetchone()
     if not counts:
-        raise RuntimeError("Could not calculate run counters")
-
+        raise RuntimeError("Could not finalize run")
     run = conn.execute(
         """
         UPDATE runs
@@ -415,23 +326,23 @@ def finalize_import_run(
             mention_count = %s,
             candidate_count = %s,
             covered_count = %s,
-            raw_summary = coalesce(%s::jsonb, raw_summary)
+            raw_summary = %s
         WHERE id = %s
-        RETURNING name
+        RETURNING id, name
         """,
         (
             int(counts["table_count"] or 0),
             int(counts["mention_count"] or 0),
             int(counts["candidate_count"] or 0),
             int(counts["covered_count"] or 0),
-            Jsonb(raw_summary) if raw_summary is not None else None,
+            Jsonb(raw_summary or {}),
             run_id,
         ),
     ).fetchone()
     if not run:
-        raise RuntimeError("Could not finalize run")
+        raise RuntimeError("Could not update run summary")
     return ImportStats(
-        run_id=run_id,
+        run_id=int(run["id"]),
         name=str(run["name"]),
         table_count=int(counts["table_count"] or 0),
         mention_count=int(counts["mention_count"] or 0),

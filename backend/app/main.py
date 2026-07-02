@@ -6,6 +6,7 @@ import re
 import time
 from json import JSONDecodeError
 from collections import Counter
+from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -19,9 +20,16 @@ from psycopg.types.json import Jsonb
 
 from .datasets import source_dataset_inventory
 from .db import connect, init_database
-from .experiment_runner import create_experiment_job, default_experiment_config
-from .experiment_runner import normalize_experiment_config
+from .experiment_runner import (
+    DEFAULT_CEREBRAS_CHAT_URL,
+    DEFAULT_LLM_CHAT_URL,
+    cancel_experiment_job,
+    create_experiment_job,
+    default_experiment_config,
+    normalize_experiment_config,
+)
 from .llm_estimation import estimate_experiment_llm_usage, estimate_llm_usage
+from .source_loader import requested_source_datasets, seed_source_data
 from .retrieval import (
     ALPACA_METADATA_URL,
     MAX_RETURNED_CANDIDATES,
@@ -32,6 +40,7 @@ from .retrieval import (
     bounded_returned_candidate_count,
     build_alpaca_query,
     extract_hits,
+    normalize_query_plan_source,
     normalize_url_slug,
 )
 
@@ -66,6 +75,12 @@ class ExperimentJobRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class SourceDiscoveryRequest(BaseModel):
+    source_root: str | None = Field(default=None, max_length=2000)
+    requested_datasets: list[str] | None = None
+    force: bool = False
+
+
 class LlmEstimateRequest(BaseModel):
     input: str = Field(default="", max_length=200000)
     model: str | None = None
@@ -73,11 +88,15 @@ class LlmEstimateRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class LlmTestRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class ExperimentEstimateRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
-SENSITIVE_CONFIG_KEYS = {"llm_api_key", "openrouter_api_key", "api_key"}
+SENSITIVE_CONFIG_KEYS = {"llm_api_key", "openrouter_api_key", "cerebras_api_key", "api_key"}
 
 
 def _redact_config(config: Any) -> Any:
@@ -100,6 +119,67 @@ def _row_or_404(row: dict[str, Any] | None, label: str = "Record") -> dict[str, 
     if not row:
         raise HTTPException(status_code=404, detail=f"{label} not found")
     return row
+
+
+def _extract_llm_response_tasks(metadata: Any) -> tuple[list[dict[str, Any]], str | None]:
+    if not isinstance(metadata, dict):
+        return [], None
+    tasks = metadata.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        return [task for task in tasks if isinstance(task, dict)], None
+    parsed = metadata.get("parsed_response")
+    if isinstance(parsed, dict) and isinstance(parsed.get("tasks"), list) and parsed.get("tasks"):
+        return [task for task in parsed["tasks"] if isinstance(task, dict)], None
+    raw = metadata.get("response_content")
+    if not isinstance(raw, str) or not raw.strip() or raw.strip() == "None":
+        return [], None
+    try:
+        parsed_raw = json.loads(raw)
+    except JSONDecodeError as exc:
+        return [], f"Stored LLM answer is not valid JSON: {exc.msg} at character {exc.pos}"
+    if isinstance(parsed_raw, dict) and isinstance(parsed_raw.get("tasks"), list):
+        return [task for task in parsed_raw["tasks"] if isinstance(task, dict)], None
+    return [], "Stored LLM answer did not contain a tasks array"
+
+
+def _compact_llm_task(task: Any) -> dict[str, Any]:
+    if not isinstance(task, dict):
+        return {}
+    return {
+        "id": task.get("id"),
+        "optimized_query": task.get("optimized_query"),
+        "normalized_mention": task.get("normalized_mention"),
+        "typo_corrected_mention": task.get("typo_corrected_mention"),
+        "coarse_type": task.get("coarse_type"),
+        "fine_type": task.get("fine_type"),
+        "wikipedia_url": task.get("wikipedia_url"),
+        "dbpedia_url": task.get("dbpedia_url"),
+        "aliases": task.get("aliases") if isinstance(task.get("aliases"), list) else [],
+        "context_expansion_terms": task.get("context_expansion_terms")
+        if isinstance(task.get("context_expansion_terms"), list)
+        else [],
+    }
+
+
+def _llm_batch_explanation(item: dict[str, Any]) -> str:
+    if item.get("error"):
+        return "The LLM request failed before producing a usable batch."
+    if item.get("response_parse_error"):
+        return "The LLM answered, but the stored answer could not be parsed as valid task JSON."
+    requested = int(item.get("task_count") or 0)
+    returned = int(item.get("returned_task_count") or 0)
+    matched = int(item.get("matched_returned_task_count") or 0)
+    usable = int(item.get("usable_task_count") or 0)
+    missing = int(item.get("missing_task_count") or 0)
+    unknown = int(item.get("unknown_returned_task_count") or 0)
+    if missing <= 0 and usable >= requested:
+        return "All requested tasks produced usable query plans."
+    if returned > 0:
+        return (
+            f"The LLM returned {returned}/{requested} task objects; {matched} matched requested IDs, "
+            f"{unknown} used unknown IDs, and {missing} requested tasks did not become usable query plans."
+        )
+    return f"No usable LLM task objects were stored for this batch; {missing}/{requested} requested tasks need attention."
 
 
 def _parse_buckets(raw: str) -> list[int]:
@@ -203,6 +283,17 @@ def _table_context_from_payload(raw_payload: Any) -> dict[str, Any]:
             "rows": rows,
         }
     return {"header": [], "rows": []}
+
+
+def _candidates_from_cache_payload(response_payload: Any, gold_qids: set[str] | None = None) -> list[dict[str, Any]]:
+    if not isinstance(response_payload, dict):
+        return []
+    candidates = extract_hits(response_payload)
+    gold_set = gold_qids or set()
+    for candidate in candidates:
+        qid = candidate.get("qid")
+        candidate["gold_match"] = bool(qid and str(qid) in gold_set)
+    return candidates
 
 
 def _is_good_augmentation_term(term: str) -> bool:
@@ -335,16 +426,49 @@ def _clean_augmentation_terms(raw_terms: Any, query_text: str, *, limit: int = 2
     return terms
 
 
+def _normalize_fine_type(raw_fine_type: Any) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    original = str(raw_fine_type or "").strip().upper() or None
+    if original == "US_STATE":
+        return original, "REGION", {
+            "rule": "fine_type_us_state_to_region",
+            "field": "fine_type",
+            "original_value": "US_STATE",
+            "normalized_value": "REGION",
+            "reason": "US_STATE is not used as a distinct retrieval fine type; REGION is the supported broader type.",
+        }
+    return original, original, None
+
+
 def normalize_query_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
 
 
 def _llm_api_key(config: dict[str, Any]) -> str:
+    provider = str(config.get("llm_provider") or "").strip().lower()
+    if provider == "cerebras":
+        return str(
+            config.get("cerebras_api_key")
+            or config.get("llm_api_key")
+            or os.environ.get("CEREBRAS_API_KEY")
+            or os.environ.get("LLM_API_KEY")
+            or ""
+        ).strip()
+    if provider == "openrouter":
+        return str(
+            config.get("openrouter_api_key")
+            or config.get("llm_api_key")
+            or os.environ.get("OPENROUTER_API_KEY")
+            or os.environ.get("LLM_API_KEY")
+            or ""
+        ).strip()
     return str(config.get("llm_api_key") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or "").strip()
 
 
 def _llm_endpoint(config: dict[str, Any]) -> str:
-    raw = str(config.get("llm_api_url") or os.environ.get("LLM_API_URL") or os.environ.get("OPENROUTER_CHAT_URL") or "https://openrouter.ai/api/v1/chat/completions").strip()
+    provider = str(config.get("llm_provider") or "").strip().lower()
+    default_url = DEFAULT_CEREBRAS_CHAT_URL if provider == "cerebras" else DEFAULT_LLM_CHAT_URL
+    provider_env_url = os.environ.get("CEREBRAS_CHAT_URL" if provider == "cerebras" else "OPENROUTER_CHAT_URL")
+    raw = str(config.get("llm_api_url") or os.environ.get("LLM_API_URL") or provider_env_url or default_url).strip()
     trimmed = raw.rstrip("/")
     if trimmed.endswith("/chat/completions"):
         return raw
@@ -387,9 +511,25 @@ def _llm_request_body(messages: list[dict[str, str]], config: dict[str, Any]) ->
         provider_config = _openrouter_provider_config(config)
         if provider_config:
             body["provider"] = provider_config
+    elif config.get("llm_provider") == "cerebras" and config.get("llm_reasoning_effort"):
+        body["reasoning_effort"] = config["llm_reasoning_effort"]
     if config.get("llm_max_tokens") is not None:
-        body["max_tokens"] = int(config["llm_max_tokens"])
+        token_key = "max_completion_tokens" if config.get("llm_provider") == "cerebras" else "max_tokens"
+        body[token_key] = int(config["llm_max_tokens"])
     return body
+
+
+def _llm_headers(config: dict[str, Any], token: str) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "coverage-dashboard/1.0",
+    }
+    if config.get("llm_provider") == "openrouter":
+        headers["HTTP-Referer"] = config["llm_site_url"]
+        headers["X-Title"] = config["llm_app_name"]
+    return headers
 
 
 def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -401,7 +541,7 @@ def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any]
     body = _llm_request_body(messages, config)
 
     timeout = int(config["llm_timeout_seconds"])
-    max_retries = max(1, int(config["llm_max_retries"]))
+    max_retries = min(5, max(1, int(config["llm_max_retries"])))
     retry_base_seconds = max(0.5, float(os.environ.get("LLM_RETRY_BASE_SECONDS", os.environ.get("OPENROUTER_RETRY_BASE_SECONDS", "4"))))
     last_error: Exception | None = None
     payload: dict[str, Any] = {}
@@ -409,12 +549,7 @@ def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any]
         request = Request(
             endpoint,
             data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": config["llm_site_url"],
-                "X-Title": config["llm_app_name"],
-            },
+            headers=_llm_headers(config, token),
             method="POST",
         )
         try:
@@ -424,7 +559,8 @@ def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any]
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             last_error = RuntimeError(f"{_llm_label(config)} HTTP {exc.code}: {detail[:500]}")
-            if exc.code == 429 and attempt < max_retries:
+            retryable = exc.code in {408, 409, 425, 429} or exc.code >= 500
+            if retryable and attempt < max_retries:
                 time.sleep(min(90.0, retry_base_seconds * (2 ** (attempt - 1))))
                 continue
             raise last_error from exc
@@ -448,6 +584,53 @@ def _llm_json_request(messages: list[dict[str, str]], llm_config: dict[str, Any]
         "response_id": payload.get("id"),
         "model_verified": payload.get("model") in (None, config["llm_model"]),
         "fallbacks_allowed": config.get("llm_provider") != "openrouter",
+    }
+
+
+def _llm_plain_request(messages: list[dict[str, str]], llm_config: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+    config = normalize_experiment_config(llm_config or {})
+    token = _llm_api_key(config)
+    if not token:
+        raise RuntimeError("LLM API key is not configured")
+    endpoint = _llm_endpoint(config)
+    body: dict[str, Any] = {
+        "model": config["llm_model"],
+        "temperature": 0,
+        "messages": messages,
+    }
+    if config.get("llm_provider") == "openrouter":
+        provider_config = _openrouter_provider_config(config)
+        if provider_config:
+            body["provider"] = provider_config
+    if config.get("llm_max_tokens") is not None:
+        token_key = "max_completion_tokens" if config.get("llm_provider") == "cerebras" else "max_tokens"
+        body[token_key] = int(config["llm_max_tokens"])
+
+    request = Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers=_llm_headers(config, token),
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=int(config["llm_timeout_seconds"])) as response:
+            payload = json.loads(response.read() or b"{}")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{_llm_label(config)} HTTP {exc.code}: {detail[:500]}") from exc
+    except (URLError, TimeoutError, JSONDecodeError) as exc:
+        raise RuntimeError(f"{_llm_label(config)} test call failed: {exc}") from exc
+
+    content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return str(content or ""), {
+        "sent": True,
+        "provider": config.get("llm_provider"),
+        "endpoint": endpoint,
+        "request_body": body,
+        "response_usage": payload.get("usage"),
+        "response_model": payload.get("model"),
+        "response_provider": payload.get("provider"),
+        "response_id": payload.get("id"),
     }
 
 
@@ -480,6 +663,7 @@ def _normalize_retrieval_signal_plan(raw_plan: dict[str, Any], fallback_query: s
         optimized_query,
         limit=3,
     )
+    original_fine_type, fine_type, fine_type_rule = _normalize_fine_type(raw_plan.get("fine_type"))
     return {
         "optimized_query": optimized_query or fallback_query,
         "normalized_mention": normalized_mention,
@@ -488,7 +672,10 @@ def _normalize_retrieval_signal_plan(raw_plan: dict[str, Any], fallback_query: s
         "typo_correction_applied": use_typo_correction,
         "typo_correction_reason": str(raw_plan.get("typo_correction_reason") or "").strip() or None,
         "coarse_type": str(raw_plan.get("coarse_type") or "").strip().upper() or None,
-        "fine_type": str(raw_plan.get("fine_type") or "").strip().upper() or None,
+        "fine_type": fine_type,
+        "original_fine_type": original_fine_type,
+        "fine_type_rule_applied": bool(fine_type_rule),
+        "fine_type_normalization": fine_type_rule,
         "wikipedia_url": normalize_url_slug(raw_plan.get("wikipedia_url") or raw_plan.get("wikipedia_title")),
         "dbpedia_url": normalize_url_slug(raw_plan.get("dbpedia_url") or raw_plan.get("dbpedia_title")),
         "aliases": aliases,
@@ -511,10 +698,13 @@ def _llm_es_query_plan(
             "normalized_mention": None,
             "coarse_type": None,
             "fine_type": None,
+            "original_fine_type": None,
+            "fine_type_rule_applied": False,
+            "fine_type_normalization": None,
             "wikipedia_url": None,
             "dbpedia_url": None,
             "aliases": [],
-            "context_expansion_terms": _table_context_terms(table_context, query_text, limit=1),
+            "context_expansion_terms": [],
             "typo_corrected_mention": None,
             "typo_correction_confidence": None,
             "typo_correction_applied": False,
@@ -528,10 +718,12 @@ def _llm_es_query_plan(
             "role": "system",
             "content": (
                 "Return JSON only. You generate one recall-oriented Elasticsearch entity retrieval plan. "
-                "Infer the intended entity from the mention, row context, column context, table context, "
-                "metadata, and optional human guidance. Keep the optimized query short: preserve or lightly "
-                "normalize the mention, expand abbreviations only when strongly supported, and add only a "
-                "small number of highly relevant tokens. If the mention appears to contain a typo and the "
+                "Use row context, column context, table context, metadata, and optional human guidance only "
+                "to infer type hints, URL slugs, aliases, or typo confidence. Keep the optimized query close "
+                "to the mention surface: do not copy column headers, neighboring cells, other mentions from "
+                "the same row, or broad table metadata into the query. Context relationships are directional "
+                "in the index, so do not add a related entity or work title unless it is itself an alias of "
+                "the mention. If the mention appears to contain a typo and the "
                 "table context makes the correction highly confident, return the corrected mention and a "
                 f"confidence >= {TYPO_CORRECTION_CONFIDENCE_THRESHOLD}; otherwise leave typo_corrected_mention null. "
                 "Predict coarse_type, fine_type, Wikipedia slug, "
@@ -579,7 +771,7 @@ def _llm_es_query_plan(
         if guidance:
             return _normalize_retrieval_signal_plan({}, query_text), "guidance_not_applied_without_llm", str(exc), llm_request
         plan = _normalize_retrieval_signal_plan(
-            {"context_expansion_terms": _table_context_terms(table_context, query_text, limit=1)},
+            {"context_expansion_terms": []},
             query_text,
         )
         return plan, "heuristic_query_plan_fallback", str(exc), llm_request
@@ -587,6 +779,7 @@ def _llm_es_query_plan(
 
 def _qid_query_body(qids: list[str]) -> dict[str, Any]:
     return {
+        "_source": True,
         "query": {
             "bool": {
                 "filter": [
@@ -596,6 +789,29 @@ def _qid_query_body(qids: list[str]) -> dict[str, Any]:
             }
         }
     }
+
+
+def _entity_with_ner_types(candidate: dict[str, Any]) -> dict[str, Any]:
+    entity = dict(candidate)
+    raw_payload = entity.get("raw_payload")
+    if isinstance(raw_payload, dict):
+        entity.setdefault("coarse_type", raw_payload.get("coarse_type"))
+        entity.setdefault("fine_type", raw_payload.get("fine_type"))
+    ner_payload = entity.get("ner")
+    if isinstance(ner_payload, dict):
+        entity.setdefault("coarse_type", ner_payload.get("coarse_type") or ner_payload.get("coarse"))
+        entity.setdefault("fine_type", ner_payload.get("fine_type") or ner_payload.get("fine"))
+    type_payload = entity.get("type")
+    if isinstance(type_payload, dict):
+        entity.setdefault("coarse_type", type_payload.get("coarse_type") or type_payload.get("coarse"))
+        entity.setdefault("fine_type", type_payload.get("fine_type") or type_payload.get("fine"))
+    entity["coarse_type"] = str(entity.get("coarse_type") or "").strip().upper() or None
+    entity["fine_type"] = str(entity.get("fine_type") or "").strip().upper() or None
+    entity["ner_types"] = {
+        "coarse_type": entity.get("coarse_type"),
+        "fine_type": entity.get("fine_type"),
+    }
+    return entity
 
 
 def _top_type_distribution(candidates: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
@@ -705,12 +921,12 @@ def startup() -> None:
         conn.execute(
             """
             UPDATE experiment_jobs
-            SET status = 'failed',
-                stage = 'failed',
-                message = 'API restarted while this job was active',
-                error = coalesce(error, 'API restarted while this job was active'),
+            SET status = CASE WHEN status = 'cancel_requested' THEN 'cancelled' ELSE 'failed' END,
+                stage = CASE WHEN status = 'cancel_requested' THEN 'cancelled' ELSE 'failed' END,
+                message = CASE WHEN status = 'cancel_requested' THEN 'Cancelled during API restart' ELSE 'API restarted while this job was active' END,
+                error = CASE WHEN status = 'cancel_requested' THEN NULL ELSE coalesce(error, 'API restarted while this job was active') END,
                 finished_at = now()
-            WHERE status IN ('queued', 'running')
+            WHERE status IN ('queued', 'running', 'cancel_requested')
             """
         )
         conn.commit()
@@ -759,6 +975,26 @@ def source_datasets() -> list[dict[str, Any]]:
         return source_dataset_inventory(conn)
 
 
+@app.post("/api/source-datasets/discover")
+def discover_source_datasets(request: SourceDiscoveryRequest) -> dict[str, Any]:
+    source_root = Path(request.source_root or os.environ.get("SOURCE_DATA_ROOT", "/source-data"))
+    requested = [str(item).strip() for item in request.requested_datasets or [] if str(item).strip()]
+    if not requested:
+        requested = requested_source_datasets(source_root)
+    try:
+        result = seed_source_data(source_root=source_root, requested_datasets=requested, force=request.force)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    with connect() as conn:
+        inventory = source_dataset_inventory(conn)
+    return {
+        **result,
+        "source_root": str(source_root),
+        "requested_datasets": requested,
+        "inventory": inventory,
+    }
+
+
 @app.get("/api/experiment-defaults")
 def experiment_defaults() -> dict[str, Any]:
     return default_experiment_config()
@@ -767,7 +1003,11 @@ def experiment_defaults() -> dict[str, Any]:
 @app.get("/api/config-status")
 def config_status() -> dict[str, Any]:
     defaults = default_experiment_config()
-    llm_key_configured = bool(os.environ.get("LLM_API_KEY", "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip())
+    llm_key_configured = bool(
+        os.environ.get("LLM_API_KEY", "").strip()
+        or os.environ.get("OPENROUTER_API_KEY", "").strip()
+        or os.environ.get("CEREBRAS_API_KEY", "").strip()
+    )
     return {
         "alpaca_configured": bool(alpaca_token()),
         "llm_configured": llm_key_configured,
@@ -776,6 +1016,7 @@ def config_status() -> dict[str, Any]:
         "llm_api_url": defaults["llm_api_url"],
         "llm_model": defaults["llm_model"],
         "openrouter_configured": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
+        "cerebras_configured": bool(os.environ.get("CEREBRAS_API_KEY", "").strip()),
         "openrouter_model": defaults["openrouter_model"],
         "openrouter_provider": defaults["openrouter_provider"],
         "openrouter_reasoning_effort": "high",
@@ -797,6 +1038,36 @@ def llm_estimate(request: LlmEstimateRequest) -> dict[str, Any]:
         )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/llm/test")
+def llm_test(request: LlmTestRequest) -> dict[str, Any]:
+    config = normalize_experiment_config({**request.config})
+    config["llm_enabled"] = True
+    if not config.get("llm_max_tokens"):
+        config["llm_max_tokens"] = 16
+    messages = [
+        {
+            "role": "user",
+            "content": "Reply with one short sentence.",
+        },
+    ]
+    try:
+        content, llm_request = _llm_plain_request(messages, config)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "ok": bool(content.strip()),
+        "provider": config.get("llm_provider"),
+        "provider_name": config.get("llm_provider_name"),
+        "endpoint": llm_request.get("endpoint"),
+        "model": config.get("llm_model"),
+        "response_model": llm_request.get("response_model"),
+        "response_provider": llm_request.get("response_provider"),
+        "response_usage": llm_request.get("response_usage"),
+        "response_id": llm_request.get("response_id"),
+        "content": content,
+    }
 
 
 @app.post("/api/experiment-estimate")
@@ -821,9 +1092,48 @@ def experiment_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[s
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT j.*, r.name AS imported_run_name
+            WITH task_stats AS (
+                SELECT batch_id,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count
+                FROM llm_prompt_tasks
+                GROUP BY batch_id
+            ),
+            batch_stats AS (
+                SELECT b.id, b.job_id, b.run_id, b.status, b.error, b.task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
+                       b.response_metadata->>'parse_warning' AS parse_warning
+                FROM llm_prompt_batches b
+                LEFT JOIN task_stats t ON t.batch_id = b.id
+                WHERE b.prompt_template = 'entity_retrieval_query_plan_v1'
+            ),
+            llm AS (
+                SELECT job_id,
+                       count(*) AS query_plan_batch_count,
+                       count(*) FILTER (WHERE status = 'completed' AND error IS NULL AND parse_warning IS NULL AND missing_task_count = 0) AS query_plan_completed_count,
+                       count(*) FILTER (WHERE status = 'failed' OR error IS NOT NULL OR parse_warning IS NOT NULL OR missing_task_count > 0) AS query_plan_failed_count,
+                       count(*) FILTER (WHERE missing_task_count > 0) AS query_plan_incomplete_batch_count,
+                       coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
+                       coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
+                       coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                FROM batch_stats
+                GROUP BY job_id
+            )
+            SELECT j.*, r.name AS imported_run_name,
+                   coalesce(llm.query_plan_batch_count, 0) AS llm_query_plan_batch_count,
+                   coalesce(llm.query_plan_completed_count, 0) AS llm_query_plan_completed_count,
+                   coalesce(llm.query_plan_failed_count, 0) AS llm_query_plan_failed_count,
+                   coalesce(llm.query_plan_incomplete_batch_count, 0) AS llm_query_plan_incomplete_batch_count,
+                   coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
+                   coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
+                   coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count
             FROM experiment_jobs j
             LEFT JOIN runs r ON r.id = j.imported_run_id
+            LEFT JOIN llm ON llm.job_id = j.id
             ORDER BY j.created_at DESC
             LIMIT %s
             """,
@@ -832,14 +1142,90 @@ def experiment_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[s
     return [_redact_job(dict(row)) for row in rows]
 
 
+@app.delete("/api/experiment-jobs/failed")
+def clear_failed_experiment_jobs() -> dict[str, int]:
+    with connect() as conn:
+        result = conn.execute("DELETE FROM experiment_jobs WHERE status IN ('failed', 'cancelled')")
+        conn.commit()
+    return {"deleted": result.rowcount or 0}
+
+
+@app.delete("/api/experiment-jobs/{job_id}")
+def delete_experiment_job(job_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                """
+                SELECT id, status, imported_run_id
+                FROM experiment_jobs
+                WHERE id = %s
+                """,
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Experiment job not found")
+            if row["status"] in {"queued", "running", "cancel_requested"}:
+                raise HTTPException(status_code=409, detail="Cancel the active job before deleting it")
+            conn.execute("DELETE FROM llm_prompt_batches WHERE job_id = %s AND run_id IS NULL", (job_id,))
+            conn.execute("UPDATE llm_prompt_batches SET job_id = NULL WHERE job_id = %s", (job_id,))
+            deleted = conn.execute(
+                """
+                DELETE FROM experiment_jobs
+                WHERE id = %s
+                RETURNING id, status, imported_run_id
+                """,
+                (job_id,),
+            ).fetchone()
+    return {"deleted": True, "id": deleted["id"], "status": deleted["status"], "imported_run_id": deleted["imported_run_id"]}
+
+
 @app.get("/api/experiment-jobs/{job_id}")
 def experiment_job(job_id: int) -> dict[str, Any]:
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT j.*, r.name AS imported_run_name
+            WITH task_stats AS (
+                SELECT batch_id,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count
+                FROM llm_prompt_tasks
+                GROUP BY batch_id
+            ),
+            batch_stats AS (
+                SELECT b.id, b.job_id, b.status, b.error, b.task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
+                       b.response_metadata->>'parse_warning' AS parse_warning
+                FROM llm_prompt_batches b
+                LEFT JOIN task_stats t ON t.batch_id = b.id
+                WHERE b.prompt_template = 'entity_retrieval_query_plan_v1'
+            ),
+            llm AS (
+                SELECT job_id,
+                       count(*) AS query_plan_batch_count,
+                       count(*) FILTER (WHERE status = 'completed' AND error IS NULL AND parse_warning IS NULL AND missing_task_count = 0) AS query_plan_completed_count,
+                       count(*) FILTER (WHERE status = 'failed' OR error IS NOT NULL OR parse_warning IS NOT NULL OR missing_task_count > 0) AS query_plan_failed_count,
+                       count(*) FILTER (WHERE missing_task_count > 0) AS query_plan_incomplete_batch_count,
+                       coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
+                       coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
+                       coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                FROM batch_stats
+                GROUP BY job_id
+            )
+            SELECT j.*, r.name AS imported_run_name,
+                   coalesce(llm.query_plan_batch_count, 0) AS llm_query_plan_batch_count,
+                   coalesce(llm.query_plan_completed_count, 0) AS llm_query_plan_completed_count,
+                   coalesce(llm.query_plan_failed_count, 0) AS llm_query_plan_failed_count,
+                   coalesce(llm.query_plan_incomplete_batch_count, 0) AS llm_query_plan_incomplete_batch_count,
+                   coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
+                   coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
+                   coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count
             FROM experiment_jobs j
             LEFT JOIN runs r ON r.id = j.imported_run_id
+            LEFT JOIN llm ON llm.job_id = j.id
             WHERE j.id = %s
             """,
             (job_id,),
@@ -847,12 +1233,12 @@ def experiment_job(job_id: int) -> dict[str, Any]:
     return _redact_job(_row_or_404(row, "Experiment job"))
 
 
-@app.delete("/api/experiment-jobs/failed")
-def clear_failed_experiment_jobs() -> dict[str, int]:
-    with connect() as conn:
-        result = conn.execute("DELETE FROM experiment_jobs WHERE status = 'failed'")
-        conn.commit()
-    return {"deleted": result.rowcount or 0}
+@app.post("/api/experiment-jobs/{job_id}/cancel")
+def cancel_job(job_id: int) -> dict[str, Any]:
+    try:
+        return _redact_job(cancel_experiment_job(job_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/runs")
@@ -860,11 +1246,51 @@ def runs() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, name, source_path, source_filename, imported_at, table_count,
-                   mention_count, candidate_count, covered_count,
-                   CASE WHEN mention_count > 0 THEN covered_count::float / mention_count ELSE 0 END AS imported_coverage
-            FROM runs
-            ORDER BY imported_at DESC
+            WITH task_stats AS (
+                SELECT batch_id,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count
+                FROM llm_prompt_tasks
+                GROUP BY batch_id
+            ),
+            batch_stats AS (
+                SELECT b.id, b.run_id, b.status, b.error, b.task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
+                       b.response_metadata->>'parse_warning' AS parse_warning
+                FROM llm_prompt_batches b
+                LEFT JOIN task_stats t ON t.batch_id = b.id
+                WHERE b.run_id IS NOT NULL
+                  AND b.prompt_template = 'entity_retrieval_query_plan_v1'
+            ),
+            llm AS (
+                SELECT run_id,
+                       count(*) AS query_plan_batch_count,
+                       count(*) FILTER (WHERE status = 'completed' AND error IS NULL AND parse_warning IS NULL AND missing_task_count = 0) AS query_plan_completed_count,
+                       count(*) FILTER (WHERE status = 'failed' OR error IS NOT NULL OR parse_warning IS NOT NULL OR missing_task_count > 0) AS query_plan_failed_count,
+                       count(*) FILTER (WHERE missing_task_count > 0) AS query_plan_incomplete_batch_count,
+                       coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
+                       coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
+                       coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                FROM batch_stats
+                GROUP BY run_id
+            )
+            SELECT r.id, r.name, r.source_path, r.source_filename, r.imported_at, r.table_count,
+                   r.mention_count, r.candidate_count, r.covered_count,
+                   CASE WHEN r.mention_count > 0 THEN r.covered_count::float / r.mention_count ELSE 0 END AS imported_coverage,
+                   coalesce(llm.query_plan_batch_count, 0) AS llm_query_plan_batch_count,
+                   coalesce(llm.query_plan_completed_count, 0) AS llm_query_plan_completed_count,
+                   coalesce(llm.query_plan_failed_count, 0) AS llm_query_plan_failed_count,
+                   coalesce(llm.query_plan_incomplete_batch_count, 0) AS llm_query_plan_incomplete_batch_count,
+                   coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
+                   coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
+                   coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count
+            FROM runs r
+            LEFT JOIN llm ON llm.run_id = r.id
+            ORDER BY r.imported_at DESC
             """
         ).fetchall()
     return list(rows)
@@ -875,16 +1301,253 @@ def run_detail(run_id: int) -> dict[str, Any]:
     with connect() as conn:
         run = conn.execute(
             """
-            SELECT id, name, source_path, source_filename, imported_at, table_count,
-                   mention_count, candidate_count, covered_count,
-                   CASE WHEN mention_count > 0 THEN covered_count::float / mention_count ELSE 0 END AS imported_coverage,
-                   raw_summary, raw_sampling_config
-            FROM runs
-            WHERE id = %s
+            WITH task_stats AS (
+                SELECT batch_id,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count
+                FROM llm_prompt_tasks
+                GROUP BY batch_id
+            ),
+            batch_stats AS (
+                SELECT b.id, b.run_id, b.status, b.error, b.task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
+                       b.response_metadata->>'parse_warning' AS parse_warning
+                FROM llm_prompt_batches b
+                LEFT JOIN task_stats t ON t.batch_id = b.id
+                WHERE b.run_id IS NOT NULL
+                  AND b.prompt_template = 'entity_retrieval_query_plan_v1'
+            ),
+            llm AS (
+                SELECT run_id,
+                       count(*) AS query_plan_batch_count,
+                       count(*) FILTER (WHERE status = 'completed' AND error IS NULL AND parse_warning IS NULL AND missing_task_count = 0) AS query_plan_completed_count,
+                       count(*) FILTER (WHERE status = 'failed' OR error IS NOT NULL OR parse_warning IS NOT NULL OR missing_task_count > 0) AS query_plan_failed_count,
+                       count(*) FILTER (WHERE missing_task_count > 0) AS query_plan_incomplete_batch_count,
+                       coalesce(sum(task_count), 0)::bigint AS query_plan_requested_task_count,
+                       coalesce(sum(returned_task_count), 0)::bigint AS query_plan_returned_task_count,
+                       coalesce(sum(usable_task_count), 0)::bigint AS query_plan_usable_task_count,
+                       coalesce(sum(missing_task_count), 0)::bigint AS query_plan_missing_task_count
+                FROM batch_stats
+                GROUP BY run_id
+            )
+            SELECT r.id, r.name, r.source_path, r.source_filename, r.imported_at, r.table_count,
+                   r.mention_count, r.candidate_count, r.covered_count,
+                   CASE WHEN r.mention_count > 0 THEN r.covered_count::float / r.mention_count ELSE 0 END AS imported_coverage,
+                   coalesce(llm.query_plan_batch_count, 0) AS llm_query_plan_batch_count,
+                   coalesce(llm.query_plan_completed_count, 0) AS llm_query_plan_completed_count,
+                   coalesce(llm.query_plan_failed_count, 0) AS llm_query_plan_failed_count,
+                   coalesce(llm.query_plan_incomplete_batch_count, 0) AS llm_query_plan_incomplete_batch_count,
+                   coalesce(llm.query_plan_requested_task_count, 0) AS llm_query_plan_requested_task_count,
+                   coalesce(llm.query_plan_returned_task_count, 0) AS llm_query_plan_returned_task_count,
+                   coalesce(llm.query_plan_usable_task_count, 0) AS llm_query_plan_usable_task_count,
+                   coalesce(llm.query_plan_missing_task_count, 0) AS llm_query_plan_missing_task_count,
+                   r.raw_summary, r.raw_sampling_config
+            FROM runs r
+            LEFT JOIN llm ON llm.run_id = r.id
+            WHERE r.id = %s
             """,
             (run_id,),
         ).fetchone()
     return _row_or_404(run, "Run")
+
+
+@app.get("/api/llm-query-plan-batches")
+def llm_query_plan_batches(
+    run_id: int | None = Query(default=None, ge=1),
+    job_id: int | None = Query(default=None, ge=1),
+    problem_only: bool = Query(default=True),
+    limit: int = Query(default=50, ge=1, le=200),
+    include_details: bool = Query(default=False),
+) -> list[dict[str, Any]]:
+    if run_id is None and job_id is None:
+        raise HTTPException(status_code=400, detail="Provide run_id or job_id")
+    filters = ["b.prompt_template = 'entity_retrieval_query_plan_v1'"]
+    params: list[Any] = []
+    if run_id is not None:
+        filters.append("b.run_id = %s")
+        params.append(run_id)
+    if job_id is not None:
+        filters.append("b.job_id = %s")
+        params.append(job_id)
+    problem_filter = ""
+    if problem_only:
+        problem_filter = "WHERE status = 'failed' OR error IS NOT NULL OR parse_warning IS NOT NULL OR missing_task_count > 0"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            WITH task_stats AS (
+                SELECT batch_id,
+                       jsonb_agg(task_id ORDER BY id) AS requested_task_ids,
+                       jsonb_agg(task_id ORDER BY task_id) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS inferred_missing_task_ids,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') <> 'heuristic') AS usable_task_count,
+                       count(*) FILTER (WHERE coalesce(plan_payload->>'query_plan_source', 'heuristic') = 'heuristic') AS missing_task_count
+                FROM llm_prompt_tasks
+                GROUP BY batch_id
+            ),
+            batch_stats AS (
+                SELECT b.id, b.run_id, b.job_id, b.provider, b.endpoint, b.model, b.prompt_template,
+                       b.task_count, b.status, b.error, b.created_at, b.request_payload,
+                       b.response_metadata,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'returned_task_count', '')::int, jsonb_array_length(coalesce(b.response_metadata->'tasks', '[]'::jsonb))) AS returned_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'usable_task_count', '')::int, t.usable_task_count, 0) AS usable_task_count,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'missing_task_count', '')::int, t.missing_task_count, 0) AS missing_task_count,
+                       coalesce(b.response_metadata->'task_trace'->'missing_task_ids', t.inferred_missing_task_ids, '[]'::jsonb) AS missing_task_ids,
+                       coalesce(b.response_metadata->'task_trace'->'requested_task_ids', t.requested_task_ids, '[]'::jsonb) AS requested_task_ids,
+                       coalesce(b.response_metadata->'task_trace'->'unknown_task_ids', '[]'::jsonb) AS unknown_returned_task_ids,
+                       coalesce(nullif(b.response_metadata->'task_trace'->>'invalid_task_count', '')::int, 0) AS invalid_task_count,
+                       b.response_metadata->>'parse_warning' AS parse_warning,
+                       b.response_metadata->'attempts' AS attempts,
+                       b.response_metadata->'usage' AS usage
+                FROM llm_prompt_batches b
+                LEFT JOIN task_stats t ON t.batch_id = b.id
+                WHERE {' AND '.join(filters)}
+            )
+            SELECT *
+            FROM batch_stats
+            {problem_filter}
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s
+            """,
+            params,
+        ).fetchall()
+        batch_ids = [int(row["id"]) for row in rows]
+        task_rows: list[dict[str, Any]] = []
+        if include_details and batch_ids:
+            task_rows = conn.execute(
+                """
+                SELECT batch_id, task_id, mention_text, lookup_text, plan_payload
+                FROM llm_prompt_tasks
+                WHERE batch_id = ANY(%s)
+                ORDER BY batch_id, id
+                """,
+                (batch_ids,),
+            ).fetchall()
+    tasks_by_batch: dict[int, list[dict[str, Any]]] = {}
+    for task in task_rows:
+        tasks_by_batch.setdefault(int(task["batch_id"]), []).append(task)
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item.pop("request_payload", None)
+        metadata = item.pop("response_metadata", {}) or {}
+        response_tasks, response_parse_error = _extract_llm_response_tasks(metadata)
+        returned_by_id = {
+            str(task.get("id")): task
+            for task in response_tasks
+            if isinstance(task, dict) and task.get("id") is not None
+        }
+        requested_ids = [str(task_id) for task_id in (item.get("requested_task_ids") or [])]
+        requested_id_set = set(requested_ids)
+        returned_ids = list(returned_by_id.keys())
+        unknown_returned_ids = [task_id for task_id in returned_ids if task_id not in requested_id_set]
+        if response_tasks:
+            item["returned_task_count"] = len(returned_ids)
+            item["matched_returned_task_count"] = len([task_id for task_id in returned_ids if task_id in requested_id_set])
+            item["unknown_returned_task_count"] = len(unknown_returned_ids)
+            item["unknown_returned_task_ids"] = unknown_returned_ids
+        else:
+            item["matched_returned_task_count"] = 0
+            item["unknown_returned_task_count"] = len(item.get("unknown_returned_task_ids") or [])
+        item["response_parse_error"] = response_parse_error
+
+        if include_details:
+            task_details = []
+            inferred_missing_ids = set(str(task_id) for task_id in (item.get("missing_task_ids") or []))
+            usable_count = 0
+            missing_ids: list[str] = []
+            for task in tasks_by_batch.get(int(item["id"]), []):
+                task_id = str(task["task_id"])
+                plan = task.get("plan_payload") if isinstance(task.get("plan_payload"), dict) else {}
+                plan_source = str(plan.get("query_plan_source") or "heuristic")
+                returned_task = returned_by_id.get(task_id)
+                usable = plan_source != "heuristic" and not plan.get("error")
+                if usable:
+                    usable_count += 1
+                else:
+                    missing_ids.append(task_id)
+                if returned_task and not usable:
+                    state = "returned_not_usable"
+                elif returned_task:
+                    state = "usable"
+                else:
+                    state = "missing"
+                task_details.append(
+                    {
+                        "task_id": task_id,
+                        "mention_text": task.get("mention_text"),
+                        "lookup_text": task.get("lookup_text"),
+                        "state": state,
+                        "returned": bool(returned_task),
+                        "usable": usable,
+                        "plan_source": plan_source,
+                        "optimized_query": plan.get("optimized_query") or (returned_task or {}).get("optimized_query"),
+                        "normalized_mention": plan.get("normalized_mention") or (returned_task or {}).get("normalized_mention"),
+                        "coarse_type": plan.get("coarse_type") or (returned_task or {}).get("coarse_type"),
+                        "fine_type": plan.get("fine_type") or (returned_task or {}).get("fine_type"),
+                        "wikipedia_url": plan.get("wikipedia_url") or (returned_task or {}).get("wikipedia_url"),
+                        "dbpedia_url": plan.get("dbpedia_url") or (returned_task or {}).get("dbpedia_url"),
+                    }
+                )
+            if task_details:
+                item["usable_task_count"] = usable_count
+                if not item.get("missing_task_ids") or inferred_missing_ids != set(missing_ids):
+                    item["missing_task_ids"] = missing_ids
+                item["missing_task_count"] = len(missing_ids)
+            item["task_details"] = task_details
+            item["returned_tasks"] = [_compact_llm_task(task) for task in response_tasks[:200]]
+            item["unknown_returned_tasks"] = [
+                _compact_llm_task(returned_by_id[task_id]) for task_id in unknown_returned_ids[:200] if task_id in returned_by_id
+            ]
+            response_content = metadata.get("response_content")
+            item["response_content"] = response_content if isinstance(response_content, str) and response_content.strip() != "None" else None
+            item["parsed_response"] = metadata.get("parsed_response") if isinstance(metadata.get("parsed_response"), dict) else None
+        item["explanation"] = _llm_batch_explanation(item)
+        items.append(item)
+    return items
+
+
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: int) -> dict[str, Any]:
+    with connect() as conn:
+        active_job = conn.execute(
+            """
+            SELECT id, status
+            FROM experiment_jobs
+            WHERE imported_run_id = %s
+              AND status IN ('queued', 'running', 'cancel_requested')
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if active_job:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run is attached to active job {active_job['id']}; cancel the job first",
+            )
+        row = conn.execute(
+            """
+            DELETE FROM runs
+            WHERE id = %s
+            RETURNING id, name
+            """,
+            (run_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+        conn.execute(
+            """
+            UPDATE experiment_jobs
+            SET imported_run_id = NULL
+            WHERE imported_run_id = %s
+            """,
+            (run_id,),
+        )
+        conn.commit()
+    return {"deleted": True, "id": row["id"], "name": row["name"]}
 
 
 @app.get("/api/runs/{run_id}/filters")
@@ -902,11 +1565,11 @@ def run_filters(run_id: int) -> dict[str, Any]:
         ).fetchall()
         stages = conn.execute(
             """
-            SELECT coalesce(retrieval_stage, 'unknown') AS retrieval_stage, count(*) AS candidate_count
-            FROM candidates c
-            JOIN mentions m ON m.id = c.mention_id
-            WHERE m.run_id = %s
-            GROUP BY coalesce(retrieval_stage, 'unknown')
+            SELECT coalesce(candidate_backend, query_engine, 'alpaca') AS retrieval_stage,
+                   coalesce(sum(candidate_count), 0) AS candidate_count
+            FROM mentions
+            WHERE run_id = %s
+            GROUP BY coalesce(candidate_backend, query_engine, 'alpaca')
             ORDER BY candidate_count DESC, retrieval_stage
             """,
             (run_id,),
@@ -922,14 +1585,9 @@ def coverage_curve(run_id: int, buckets: str | None = Query(default=None)) -> li
         else:
             max_rank_row = conn.execute(
                 """
-                SELECT coalesce(max(coalesce(m.best_gt_rank, m.retrieved_count, c.max_candidate_rank)), 1) AS max_rank
-                FROM mentions m
-                LEFT JOIN LATERAL (
-                    SELECT max(rank) AS max_candidate_rank
-                    FROM candidates c
-                    WHERE c.mention_id = m.id
-                ) c ON true
-                WHERE m.run_id = %s
+                SELECT coalesce(max(coalesce(best_gt_rank, retrieved_count, candidate_count)), 1) AS max_rank
+                FROM mentions
+                WHERE run_id = %s
                 """,
                 (run_id,),
             ).fetchone()
@@ -937,30 +1595,10 @@ def coverage_curve(run_id: int, buckets: str | None = Query(default=None)) -> li
 
         rows = conn.execute(
             """
-            WITH selected_mentions AS (
-                SELECT id, best_gt_rank
+            WITH scored_mentions AS (
+                SELECT id, best_gt_rank AS imported_best_rank
                 FROM mentions
                 WHERE run_id = %s
-            ),
-            gold_hits AS (
-                SELECT c.mention_id, min(c.rank) AS gold_best_rank
-                FROM candidates c
-                JOIN selected_mentions m ON m.id = c.mention_id
-                JOIN gold_qids g ON g.mention_id = c.mention_id AND g.qid = c.qid
-                GROUP BY c.mention_id
-            ),
-            scored_mentions AS (
-                SELECT
-                    m.id,
-                    nullif(
-                        least(
-                            coalesce(m.best_gt_rank, 2147483647),
-                            coalesce(gold_hits.gold_best_rank, 2147483647)
-                        ),
-                        2147483647
-                    ) AS imported_best_rank
-                FROM selected_mentions m
-                LEFT JOIN gold_hits ON gold_hits.mention_id = m.id
             ),
             ks AS (
                 SELECT unnest(%s::int[]) AS k
@@ -1007,40 +1645,20 @@ def run_mentions(
         base_conditions.append("m.dataset_id = %s")
         base_params.append(dataset_id)
     if search:
-        base_conditions.append("(m.mention ILIKE %s OR m.lookup_text ILIKE %s OR m.cell_key ILIKE %s)")
+        base_conditions.append("(m.mention_text ILIKE %s OR m.lookup_text ILIKE %s OR m.cell_key ILIKE %s)")
         like = f"%{search}%"
         base_params.extend([like, like, like])
 
     base_where = " AND ".join(base_conditions)
     scored_cte = f"""
-        WITH gold_hits AS (
-            SELECT c.mention_id, min(c.rank) AS gold_best_rank
-            FROM candidates c
-            JOIN gold_qids g ON g.mention_id = c.mention_id AND g.qid = c.qid
-            JOIN mentions m ON m.id = c.mention_id
-            WHERE {base_where}
-            GROUP BY c.mention_id
-        ),
-        scored_mentions AS (
+        WITH scored_mentions AS (
             SELECT
                 m.id, m.cell_key, m.dataset_id, m.table_id, m.row_id, m.col_id,
-                m.mention, m.lookup_text, m.primary_gt_qid, m.selected_qid, m.selected_label,
-                m.final_correct, m.coverage_correct, m.hit_at_1, m.hit_at_5, m.hit_at_10,
-                m.hit_at_k, m.best_gt_rank, m.retrieved_count, m.candidate_count,
-                (
-                    coalesce(m.coverage_correct, false)
-                    OR m.best_gt_rank IS NOT NULL
-                    OR gold_hits.gold_best_rank IS NOT NULL
-                ) AS covered_by_imported_candidates,
-                nullif(
-                    least(
-                        coalesce(m.best_gt_rank, 2147483647),
-                        coalesce(gold_hits.gold_best_rank, 2147483647)
-                    ),
-                    2147483647
-                ) AS imported_best_rank
+                m.mention_text AS mention, m.lookup_text, m.primary_gt_qid,
+                m.best_gt_rank, m.retrieved_count, m.candidate_count,
+                (m.best_gt_rank IS NOT NULL) AS covered_by_imported_candidates,
+                m.best_gt_rank AS imported_best_rank
             FROM mentions m
-            LEFT JOIN gold_hits ON gold_hits.mention_id = m.id
             WHERE {base_where}
         )
     """
@@ -1049,7 +1667,7 @@ def run_mentions(
         score_where = "covered_by_imported_candidates"
     elif covered == "missed":
         score_where = "NOT covered_by_imported_candidates"
-    scored_params = [*base_params, *base_params]
+    scored_params = [*base_params]
     with connect() as conn:
         total = conn.execute(
             f"{scored_cte} SELECT count(*) AS total FROM scored_mentions WHERE {score_where}",
@@ -1077,34 +1695,19 @@ def mention_detail(mention_id: int) -> dict[str, Any]:
     with connect() as conn:
         mention = conn.execute(
             """
-            WITH gold_hits AS (
-                SELECT c.mention_id, min(c.rank) AS gold_best_rank
-                FROM candidates c
-                JOIN gold_qids g ON g.mention_id = c.mention_id AND g.qid = c.qid
-                WHERE c.mention_id = %s
-                GROUP BY c.mention_id
-            )
             SELECT
                 m.*,
+                m.mention_text AS mention,
                 r.name AS run_name,
-                (
-                    coalesce(m.coverage_correct, false)
-                    OR m.best_gt_rank IS NOT NULL
-                    OR gold_hits.gold_best_rank IS NOT NULL
-                ) AS covered_by_imported_candidates,
-                nullif(
-                    least(
-                        coalesce(m.best_gt_rank, 2147483647),
-                        coalesce(gold_hits.gold_best_rank, 2147483647)
-                    ),
-                    2147483647
-                ) AS imported_best_rank
+                (m.best_gt_rank IS NOT NULL) AS covered_by_imported_candidates,
+                m.best_gt_rank AS imported_best_rank,
+                cache.response_payload AS cached_response_payload
             FROM mentions m
             JOIN runs r ON r.id = m.run_id
-            LEFT JOIN gold_hits ON gold_hits.mention_id = m.id
+            LEFT JOIN candidate_retrieval_cache cache ON cache.cache_key = m.candidate_cache_key
             WHERE m.id = %s
             """,
-            (mention_id, mention_id),
+            (mention_id,),
         ).fetchone()
         _row_or_404(mention, "Mention")
         gold = conn.execute(
@@ -1116,17 +1719,9 @@ def mention_detail(mention_id: int) -> dict[str, Any]:
             """,
             (mention_id,),
         ).fetchall()
-        candidates = conn.execute(
-            """
-            SELECT id, rank, source_rank, qid, label, item_category, coarse_type, fine_type,
-                   retrieval_system, retrieval_stage, retrieval_stages, score, es_score,
-                   heuristic_score, selected, gold_match, raw_payload
-            FROM candidates
-            WHERE mention_id = %s
-            ORDER BY rank
-            """,
-            (mention_id,),
-        ).fetchall()
+        gold_qid_set = {str(row["qid"]) for row in gold if row.get("qid")}
+        candidates = _candidates_from_cache_payload(mention.get("cached_response_payload"), gold_qid_set)
+        mention.pop("cached_response_payload", None)
         feedback = conn.execute(
             """
             SELECT id, created_at, category, note, metadata
@@ -1147,13 +1742,28 @@ def mention_detail(mention_id: int) -> dict[str, Any]:
             """,
             (mention_id,),
         ).fetchall()
+        query_plan_batch = None
+        if mention.get("query_plan_batch_id"):
+            query_plan_batch = conn.execute(
+                """
+                SELECT
+                    b.id, b.run_id, b.job_id, b.provider, b.endpoint, b.model,
+                    b.prompt_template, b.task_count, b.status, b.error,
+                    b.request_payload, b.response_metadata, b.created_at,
+                    t.task_id, t.mention_text, t.lookup_text, t.plan_payload
+                FROM llm_prompt_batches b
+                LEFT JOIN llm_prompt_tasks t ON t.batch_id = b.id AND t.mention_id = %s
+                WHERE b.id = %s
+                """,
+                (mention_id, mention["query_plan_batch_id"]),
+            ).fetchone()
         attempt_rows = []
         for attempt in attempts:
             attempt_row = dict(attempt)
             response_payload = attempt_row.get("response_payload")
             if isinstance(response_payload, dict):
-                candidates = response_payload.get("candidates")
-                if isinstance(candidates, list):
+                attempt_candidates = response_payload.get("candidates")
+                if isinstance(attempt_candidates, list):
                     covered_qids = {str(qid) for qid in attempt_row.get("covered_qids") or []}
                     attempt_row["candidates"] = [
                         {
@@ -1161,7 +1771,7 @@ def mention_detail(mention_id: int) -> dict[str, Any]:
                             "gold_match": bool(candidate.get("gold_match"))
                             or bool(candidate.get("qid") and str(candidate.get("qid")) in covered_qids),
                         }
-                        for candidate in candidates
+                        for candidate in attempt_candidates
                         if isinstance(candidate, dict)
                     ]
             attempt_rows.append(attempt_row)
@@ -1172,6 +1782,7 @@ def mention_detail(mention_id: int) -> dict[str, Any]:
         "feedback": list(feedback),
         "live_attempts": attempt_rows,
         "table_context": _table_context_from_payload(mention.get("raw_payload")),
+        "query_plan_batch": query_plan_batch,
     }
 
 
@@ -1194,13 +1805,44 @@ def mention_gold_metadata(mention_id: int) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    by_qid = {str(candidate.get("qid")): candidate for candidate in hits if candidate.get("qid")}
+    by_qid = {
+        str(candidate.get("qid")): _entity_with_ner_types(candidate)
+        for candidate in hits
+        if candidate.get("qid")
+    }
+    resolved_entities = [by_qid[qid] for qid in qids if qid in by_qid]
+    if resolved_entities:
+        with connect() as conn:
+            conn.cursor().executemany(
+                """
+                UPDATE gold_qids
+                SET raw_entity = %s
+                WHERE mention_id = %s
+                  AND qid = %s
+                """,
+                [
+                    (Jsonb(entity), mention_id, str(entity["qid"]))
+                    for entity in resolved_entities
+                    if entity.get("qid")
+                ],
+            )
+            conn.commit()
+
     for qid in qids:
         if qid in by_qid:
             return {
                 "requested_qids": qids,
                 "resolved_qid": qid,
                 "entity": by_qid[qid],
+                "entities": resolved_entities,
+                "ner_types": [
+                    {
+                        "qid": entity.get("qid"),
+                        "coarse_type": entity.get("coarse_type"),
+                        "fine_type": entity.get("fine_type"),
+                    }
+                    for entity in resolved_entities
+                ],
                 "all_found_qids": [str(candidate.get("qid")) for candidate in hits if candidate.get("qid")],
             }
 
@@ -1208,6 +1850,8 @@ def mention_gold_metadata(mention_id: int) -> dict[str, Any]:
         "requested_qids": qids,
         "resolved_qid": None,
         "entity": None,
+        "entities": [],
+        "ner_types": [],
         "all_found_qids": [],
     }
 
@@ -1235,7 +1879,7 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
     with connect() as conn:
         mention = conn.execute(
             """
-            SELECT id, mention, lookup_text, raw_payload
+            SELECT id, mention_text AS mention, lookup_text, raw_payload
             FROM mentions
             WHERE id = %s
             """,
@@ -1258,13 +1902,11 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
             human_guidance=request.human_guidance,
             llm_config=request.llm_config,
         )
-        context_text = _target_context_text(table_context)
+        query_plan_generator = normalize_query_plan_source(query_plan_source)
+        mention_text = (mention.get("mention") or mention.get("lookup_text") or query_text).strip()
         query_body = build_alpaca_query(
             query_plan.get("optimized_query") or query_text,
-            {
-                **query_plan,
-                "context_text": context_text,
-            },
+            query_plan,
         )
         alpaca_request_payload = {
             **query_body,
@@ -1275,10 +1917,20 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
                 "candidate_count": retrieval_count,
                 "optimized_query": query_plan.get("optimized_query"),
                 "retrieval_strategy": "single_query_recall_soft_boosts",
+                "query_plan_source": query_plan_source,
+                "query_plan_generator": query_plan_generator,
+                "cache_key_fields": {
+                    "mention": mention_text,
+                    "query": query_plan.get("optimized_query") or query_text,
+                    "query_plan_source": query_plan_generator,
+                },
                 "hard_filters": {"item_category": ["ENTITY", "TYPE"]},
                 "soft_signals": {
                     "coarse_type": query_plan.get("coarse_type"),
                     "fine_type": query_plan.get("fine_type"),
+                    "original_fine_type": query_plan.get("original_fine_type"),
+                    "fine_type_rule_applied": query_plan.get("fine_type_rule_applied"),
+                    "fine_type_normalization": query_plan.get("fine_type_normalization"),
                     "typo_corrected_mention": query_plan.get("typo_corrected_mention"),
                     "typo_correction_confidence": query_plan.get("typo_correction_confidence"),
                     "typo_correction_applied": query_plan.get("typo_correction_applied"),
@@ -1298,7 +1950,13 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
         covered_qids: list[str] = []
         diagnostics: dict[str, Any] = {}
         try:
-            response_payload = alpaca_search(query_body, retrieval_count)
+            response_payload = alpaca_search(
+                query_body,
+                retrieval_count,
+                mention_text=mention_text,
+                query_text=query_plan.get("optimized_query") or query_text,
+                query_plan_source=query_plan_generator,
+            )
             raw_candidates = extract_hits(response_payload)
             candidate_qids = {str(candidate.get("qid")) for candidate in raw_candidates if candidate.get("qid")}
             covered_qids = sorted(gold_qids & candidate_qids)
@@ -1349,6 +2007,7 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
                         "query_plan": query_plan,
                         "query_plan_terms": query_plan.get("context_expansion_terms", []),
                         "query_plan_source": query_plan_source,
+                        "query_plan_generator": query_plan_generator,
                         "query_plan_error": query_plan_error,
                         "augmentation_terms": query_plan.get("context_expansion_terms", []),
                         "augmentation_source": query_plan_source,
@@ -1383,7 +2042,6 @@ def live_attempt(mention_id: int, request: LiveAttemptRequest) -> dict[str, Any]
                                     }
                                     for candidate in raw_candidates
                                 ],
-                                "selected_candidate": candidates[0] if candidates else None,
                             },
                         },
                         "improvement_diagnostics": diagnostics,
